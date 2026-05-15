@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_NAME="scopewise"
-APP_VER="0.2"
+APP_VER="0.2.4"
 
 MODE="fast"
 TARGET_SINGLE=""
@@ -21,9 +21,9 @@ WL_FILE_MEDIUM="/usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt"
 banner() {
 cat <<'EOF_BANNER'
 
-▄█████  ▄▄▄▄  ▄▄▄  ▄▄▄▄  ▄▄▄▄▄ ██     ██ ▄▄  ▄▄▄▄ ▄▄▄▄▄
-▀▀▀▄▄▄ ██▀▀▀ ██▀██ ██▄█▀ ██▄▄  ██ ▄█▄ ██ ██ ███▄▄ ██▄▄
-█████▀ ▀████ ▀███▀ ██    ██▄▄▄  ▀██▀██▀  ██ ▄▄██▀ ██▄▄▄
+\u2584\u2588\u2588\u2588\u2588\u2588  \u2584\u2584\u2584\u2584  \u2584\u2584\u2584  \u2584\u2584\u2584\u2584  \u2584\u2584\u2584\u2584\u2584 \u2588\u2588     \u2588\u2588 \u2584\u2584  \u2584\u2584\u2584\u2584 \u2584\u2584\u2584\u2584\u2584
+\u2580\u2580\u2580\u2584\u2584\u2584 \u2588\u2588\u2580\u2580\u2580 \u2588\u2588\u2580\u2588\u2588 \u2588\u2588\u2584\u2588\u2580 \u2588\u2588\u2584\u2584  \u2588\u2588 \u2584\u2588\u2584 \u2588\u2588 \u2588\u2588 \u2588\u2588\u2588\u2584\u2584 \u2588\u2588\u2584\u2584
+\u2588\u2588\u2588\u2588\u2588\u2580 \u2580\u2588\u2588\u2588\u2588 \u2580\u2588\u2588\u2588\u2580 \u2588\u2588    \u2588\u2588\u2584\u2584\u2584  \u2580\u2588\u2588\u2580\u2588\u2588\u2580  \u2588\u2588 \u2584\u2584\u2588\u2588\u2580 \u2588\u2588\u2584\u2584\u2584
 
 EOF_BANNER
 printf '  %s v%s\n\n' "$APP_NAME" "$APP_VER"
@@ -361,6 +361,9 @@ Review first:
   reports/nuclei_exposures.jsonl
   reports/nuclei_takeover.jsonl
   reports/nuclei.jsonl
+  reports/nikto.json
+  reports/nmap_web.xml
+  reports/sslscan.xml
   context/interesting_files.txt
   context/interesting_params.txt
   context/api_candidates.txt
@@ -372,6 +375,15 @@ Review first:
   reports/subzy.json
   reports/gowitness/
 
+Gowitness review:
+  cd "$host_out"
+  gowitness report server \
+    --db-uri "sqlite://reports/gowitness/gowitness.sqlite3" \
+    --screenshot-path "reports/gowitness/screenshots"
+
+Then open:
+  http://127.0.0.1:7171
+
 Manual queues:
   context/redirect_candidates.txt
   context/lfi_candidates.txt
@@ -382,7 +394,6 @@ Context:
   context/live_urls.txt
   context/katana_urls.txt
   context/waybackurls.txt
-  context/gau.txt
   context/subdomains.txt
 
 Troubleshooting:
@@ -550,9 +561,7 @@ for host in "${HOSTS[@]}"; do
     fi
 
     WAYBACK_URLS="$host_out/context/waybackurls.txt"
-    GAU_URLS="$host_out/context/gau.txt"
     : >"$WAYBACK_URLS"
-    : >"$GAU_URLS"
 
     if have waybackurls; then
       run_step "waybackurls" "waybackurls" "$host_out" \
@@ -561,15 +570,8 @@ for host in "${HOSTS[@]}"; do
       print_skip "waybackurls (not installed)"
     fi
 
-    if have gau; then
-      run_step "gau" "gau" "$host_out" \
-        bash -c "printf '%s\n' '$host' | gau | sort -u > '$GAU_URLS'" || true
-    else
-      print_skip "gau (not installed)"
-    fi
-
     ALL_URLS="$host_out/context/all_urls.txt"
-    cat "$HOST_URLS" "$KATANA_URLS" "$WAYBACK_URLS" "$GAU_URLS" 2>/dev/null \
+    cat "$HOST_URLS" "$KATANA_URLS" "$WAYBACK_URLS" 2>/dev/null \
       | awk 'NF{print}' \
       | sed 's/\r$//' \
       | sort -u >"$ALL_URLS"
@@ -764,11 +766,16 @@ for host in "${HOSTS[@]}"; do
     fi
 
     if have gowitness; then
-      mkdir -p "$host_out/reports/gowitness"
+      mkdir -p "$host_out/reports/gowitness/screenshots"
       run_step "gowitness" "gowitness" "$host_out" gowitness scan file \
         -f "$HOST_URLS" \
+        --screenshot-path "$host_out/reports/gowitness/screenshots" \
         --write-db \
-        --screenshot-path "$host_out/reports/gowitness" || true
+        --write-db-uri "sqlite://$host_out/reports/gowitness/gowitness.sqlite3" \
+        --write-jsonl \
+        --write-jsonl-file "$host_out/reports/gowitness/gowitness.jsonl" \
+        --write-csv \
+        --write-csv-file "$host_out/reports/gowitness/gowitness.csv" || true
     else
       print_skip "gowitness (not installed)"
     fi
