@@ -2,16 +2,30 @@
 set -euo pipefail
 
 APP_NAME="scopewise"
-APP_VER="0.1"
+APP_VER="0.2"
+
+MODE="fast"
+TARGET_SINGLE=""
+TARGET_FILE=""
+
+WEB_PORTS="80,443,8080,8443,8000,8888,3000,5000,9000"
+EXTENSIONS="php,html,js,json,xml,txt,log,bak,backup,old,zip,tar,gz,tgz,sql,db,sqlite,env,config,conf,ini,yml,yaml,map"
+FFUF_EXTENSIONS=".php,.html,.js,.json,.xml,.txt,.log,.bak,.backup,.old,.zip,.tar.gz,.tgz,.sql,.db,.sqlite,.env,.config,.conf,.ini,.yml,.yaml,.map"
+
+WL_COMMON="/usr/share/seclists/Discovery/Web-Content/common.txt"
+WL_DIR_SMALL="/usr/share/seclists/Discovery/Web-Content/raft-small-directories.txt"
+WL_DIR_MEDIUM="/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
+WL_FILE_SMALL="/usr/share/seclists/Discovery/Web-Content/raft-small-files.txt"
+WL_FILE_MEDIUM="/usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt"
 
 banner() {
-cat <<'EOF'                            
-                                                        
-▄█████  ▄▄▄▄  ▄▄▄  ▄▄▄▄  ▄▄▄▄▄ ██     ██ ▄▄  ▄▄▄▄ ▄▄▄▄▄ 
-▀▀▀▄▄▄ ██▀▀▀ ██▀██ ██▄█▀ ██▄▄  ██ ▄█▄ ██ ██ ███▄▄ ██▄▄  
-█████▀ ▀████ ▀███▀ ██    ██▄▄▄  ▀██▀██▀  ██ ▄▄██▀ ██▄▄▄ 
-                                                        
-EOF
+cat <<'EOF_BANNER'
+
+▄█████  ▄▄▄▄  ▄▄▄  ▄▄▄▄  ▄▄▄▄▄ ██     ██ ▄▄  ▄▄▄▄ ▄▄▄▄▄
+▀▀▀▄▄▄ ██▀▀▀ ██▀██ ██▄█▀ ██▄▄  ██ ▄█▄ ██ ██ ███▄▄ ██▄▄
+█████▀ ▀████ ▀███▀ ██    ██▄▄▄  ▀██▀██▀  ██ ▄▄██▀ ██▄▄▄
+
+EOF_BANNER
 printf '  %s v%s\n\n' "$APP_NAME" "$APP_VER"
 }
 
@@ -26,9 +40,21 @@ BLU=$'\033[34m'
 RST=$'\033[0m'
 
 usage() {
-  echo "Usage:"
-  echo "  $0 -u <domain|url>"
-  echo "  $0 -f <file_with_domains_or_urls>"
+  cat <<EOF_USAGE
+Usage:
+  $0 -u <domain|url> [--fast|--deep|--passive]
+  $0 -f <file_with_domains_or_urls> [--fast|--deep|--passive]
+
+Modes:
+  --fast      Default. Balanced first-pass bounty recon.
+  --deep      More thorough content discovery and crawling.
+  --passive   Passive/light mode. Skips active content discovery and heavier scans.
+
+Examples:
+  $0 -u example.com
+  $0 -u example.com --deep
+  $0 -f urls.txt --passive
+EOF_USAGE
   exit 1
 }
 
@@ -55,6 +81,14 @@ host_of() {
   printf '%s' "$x"
 }
 
+url_host() {
+  local u="${1#http://}"
+  u="${u#https://}"
+  u="${u%%/*}"
+  u="${u%%:*}"
+  printf '%s\n' "$u"
+}
+
 log_line() {
   local msg="$1"
   [[ -n "${LOG:-}" ]] || return 0
@@ -79,7 +113,7 @@ trap 'trap_int' INT
 run_step() {
   local label="$1"
   local tool="$2"
-  local outdir="$3"
+  local host_out="$3"
   shift 3
 
   local soft_rcs="${SOFT_RCS:-}"
@@ -88,8 +122,9 @@ run_step() {
     shift 2
   fi
 
-  local stdout_file="${outdir}/debug/${tool}.stdout"
-  local stderr_file="${outdir}/debug/${tool}.stderr"
+  mkdir -p "${host_out}/debug"
+  local stdout_file="${host_out}/debug/${tool}.stdout"
+  local stderr_file="${host_out}/debug/${tool}.stderr"
 
   INT_SKIP=0
   log_line "START: ${label}"
@@ -153,8 +188,8 @@ pick_best_url() {
   local host="$2"
   local best=""
   if [[ -s "$urls_file" ]]; then
-    best="$(grep -E "^https://${host}(/|$)" "$urls_file" | head -n 1 || true)"
-    [[ -z "$best" ]] && best="$(grep -E "^http://${host}(/|$)" "$urls_file" | head -n 1 || true)"
+    best="$(grep -E "^https://${host}(:[0-9]+)?(/|$)" "$urls_file" | head -n 1 || true)"
+    [[ -z "$best" ]] && best="$(grep -E "^http://${host}(:[0-9]+)?(/|$)" "$urls_file" | head -n 1 || true)"
     [[ -z "$best" ]] && best="$(head -n 1 "$urls_file" 2>/dev/null || true)"
   fi
   if [[ -z "$best" ]]; then
@@ -163,29 +198,211 @@ pick_best_url() {
   printf '%s\n' "$best"
 }
 
-url_host() {
-  local u="${1#http://}"
-  u="${u#https://}"
-  u="${u%%/*}"
-  u="${u%%:*}"
-  printf '%s\n' "$u"
+choose_wordlist() {
+  local preferred="$1"
+  local fallback="$2"
+  if [[ -f "$preferred" ]]; then
+    printf '%s\n' "$preferred"
+  elif [[ -f "$fallback" ]]; then
+    printf '%s\n' "$fallback"
+  else
+    printf '%s\n' "$preferred"
+  fi
 }
 
-TARGET_SINGLE=""
-TARGET_FILE=""
+parse_args() {
+  if [[ "$#" -eq 0 ]]; then
+    usage
+  fi
 
-while getopts ":u:f:" opt; do
-  case "$opt" in
-    u) TARGET_SINGLE="$OPTARG" ;;
-    f) TARGET_FILE="$OPTARG" ;;
-    *) usage ;;
+  while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+      -u)
+        shift
+        [[ "$#" -gt 0 ]] || usage
+        TARGET_SINGLE="$1"
+        ;;
+      -f)
+        shift
+        [[ "$#" -gt 0 ]] || usage
+        TARGET_FILE="$1"
+        ;;
+      --fast)
+        MODE="fast"
+        ;;
+      --deep)
+        MODE="deep"
+        ;;
+      --passive)
+        MODE="passive"
+        ;;
+      -h|--help)
+        usage
+        ;;
+      *)
+        print_fail "Unknown option: $1"
+        usage
+        ;;
+    esac
+    shift
+  done
+}
+
+configure_mode() {
+  case "$MODE" in
+    fast)
+      HTTPX_RL="80"
+      NUCLEI_RL="30"
+      NUCLEI_C="10"
+      KATANA_DEPTH="3"
+      FEROX_RL="30"
+      FEROX_DEPTH="2"
+      FFUF_RATE="30"
+      DIR_WL="$(choose_wordlist "$WL_DIR_SMALL" "$WL_COMMON")"
+      FILE_WL="$(choose_wordlist "$WL_FILE_SMALL" "$WL_COMMON")"
+      ;;
+    deep)
+      HTTPX_RL="80"
+      NUCLEI_RL="40"
+      NUCLEI_C="15"
+      KATANA_DEPTH="4"
+      FEROX_RL="20"
+      FEROX_DEPTH="3"
+      FFUF_RATE="20"
+      DIR_WL="$(choose_wordlist "$WL_DIR_MEDIUM" "$WL_COMMON")"
+      FILE_WL="$(choose_wordlist "$WL_FILE_MEDIUM" "$WL_COMMON")"
+      ;;
+    passive)
+      HTTPX_RL="50"
+      NUCLEI_RL="15"
+      NUCLEI_C="5"
+      KATANA_DEPTH="2"
+      FEROX_RL="0"
+      FEROX_DEPTH="0"
+      FFUF_RATE="0"
+      DIR_WL="$(choose_wordlist "$WL_DIR_SMALL" "$WL_COMMON")"
+      FILE_WL="$(choose_wordlist "$WL_FILE_SMALL" "$WL_COMMON")"
+      ;;
+    *)
+      print_fail "Invalid mode: $MODE"
+      exit 1
+      ;;
   esac
-done
+}
 
+normalize_httpx_urls() {
+  local input="$1"
+  local output="$2"
+  if [[ -s "$input" ]]; then
+    awk '{print $1}' "$input" | grep -E '^https?://' | sed 's/\r$//' | sort -u >"$output" || true
+  else
+    : >"$output"
+  fi
+}
+
+extract_context_files() {
+  local host_out="$1"
+  local all_urls="$host_out/context/all_urls.txt"
+
+  : >"$host_out/context/interesting_files.txt"
+  : >"$host_out/context/interesting_params.txt"
+  : >"$host_out/context/api_candidates.txt"
+  : >"$host_out/context/js_files.txt"
+  : >"$host_out/context/source_maps.txt"
+  : >"$host_out/context/redirect_candidates.txt"
+  : >"$host_out/context/lfi_candidates.txt"
+  : >"$host_out/context/sqli_candidates.txt"
+
+  [[ -s "$all_urls" ]] || return 0
+
+  grep -Ei '\.env($|\?)|\.bak($|\?)|\.backup($|\?)|\.old($|\?)|\.zip($|\?)|\.tar($|\?)|\.gz($|\?)|\.tgz($|\?)|\.rar($|\?)|\.7z($|\?)|\.sql($|\?)|\.db($|\?)|\.sqlite($|\?)|\.log($|\?)|\.config($|\?)|\.conf($|\?)|\.ini($|\?)|\.yml($|\?)|\.yaml($|\?)|\.json($|\?)|\.map($|\?)' "$all_urls" \
+    | sort -u >"$host_out/context/interesting_files.txt" || true
+
+  grep -Ei 'redirect=|url=|next=|return=|dest=|destination=|continue=|callback=|file=|path=|folder=|doc=|document=|template=|page=|id=|user=|account=|debug=|token=|key=|secret=|api' "$all_urls" \
+    | sort -u >"$host_out/context/interesting_params.txt" || true
+
+  grep -Ei '/api/|/v1/|/v2/|/v3/|graphql|graphiql|swagger|openapi|api-docs|swagger-ui' "$all_urls" \
+    | sort -u >"$host_out/context/api_candidates.txt" || true
+
+  grep -Ei '\.js($|\?)' "$all_urls" \
+    | sort -u >"$host_out/context/js_files.txt" || true
+
+  grep -Ei '\.map($|\?)' "$all_urls" \
+    | sort -u >"$host_out/context/source_maps.txt" || true
+
+  grep -Ei 'redirect=|url=|next=|return=|dest=|destination=|continue=' "$all_urls" \
+    | sort -u >"$host_out/context/redirect_candidates.txt" || true
+
+  grep -Ei 'file=|path=|folder=|doc=|document=|template=|page=' "$all_urls" \
+    | sort -u >"$host_out/context/lfi_candidates.txt" || true
+
+  grep -Ei 'id=|user=|account=|product=|item=|category=|search=|q=' "$all_urls" \
+    | sort -u >"$host_out/context/sqli_candidates.txt" || true
+}
+
+count_file() {
+  local f="$1"
+  if [[ -s "$f" ]]; then
+    wc -l <"$f" | tr -d ' '
+  else
+    printf '0'
+  fi
+}
+
+write_host_readme() {
+  local host_out="$1"
+  local host="$2"
+
+  cat >"$host_out/README-FIRST.txt" <<EOF_README
+ScopeWise host output: $host
+Mode: $MODE
+
+Review first:
+  reports/nuclei_exposures.jsonl
+  reports/nuclei_takeover.jsonl
+  reports/nuclei.jsonl
+  context/interesting_files.txt
+  context/interesting_params.txt
+  context/api_candidates.txt
+  context/js_files.txt
+  context/source_maps.txt
+  reports/feroxbuster.txt
+  reports/ffuf_files.csv
+  reports/ffuf_dirs.csv
+  reports/subzy.json
+  reports/gowitness/
+
+Manual queues:
+  context/redirect_candidates.txt
+  context/lfi_candidates.txt
+  context/sqli_candidates.txt
+
+Context:
+  context/all_urls.txt
+  context/live_urls.txt
+  context/katana_urls.txt
+  context/waybackurls.txt
+  context/gau.txt
+  context/subdomains.txt
+
+Troubleshooting:
+  debug/*.stdout
+  debug/*.stderr
+  tmp/
+EOF_README
+}
+
+parse_args "$@"
 banner
+configure_mode
 
 if [[ -z "${TARGET_SINGLE}" && -z "${TARGET_FILE}" ]]; then
   usage
+fi
+
+if [[ -n "${TARGET_SINGLE}" && -n "${TARGET_FILE}" ]]; then
+  print_fail "Use either -u or -f, not both."
+  exit 1
 fi
 
 if [[ -n "${TARGET_FILE}" && ! -f "${TARGET_FILE}" ]]; then
@@ -238,7 +455,11 @@ printf '%s\n' "${HOSTS[@]}" >"$RUN_DIR/hosts.txt"
 
 TOTAL_HOSTS="${#HOSTS[@]}"
 print_done "Targets: ${TOTAL_HOSTS} host(s)"
+print_done "Mode: ${MODE}"
 log_line "Targets: ${TOTAL_HOSTS} host(s)"
+log_line "Mode: ${MODE}"
+log_line "Dir wordlist: ${DIR_WL}"
+log_line "File wordlist: ${FILE_WL}"
 
 idx=0
 for host in "${HOSTS[@]}"; do
@@ -248,212 +469,375 @@ for host in "${HOSTS[@]}"; do
 
     printf '\n%s[%s/%s] %s%s\n' "$BLU" "$idx" "$TOTAL_HOSTS" "$host" "$RST"
     log_line "HOST: ${host} (${idx}/${TOTAL_HOSTS})"
+
     host_out="$OUT_DIR/$host"
-    mkdir -p "$host_out/debug"
+    mkdir -p "$host_out/reports" "$host_out/context" "$host_out/debug" "$host_out/tmp"
     log_line "HOST_OUT: $host_out"
 
-  HOST_BASE_URLS="$host_out/urls_source.txt"
-  {
-    printf 'https://%s\n' "$host"
-    printf 'http://%s\n' "$host"
-  } | sort -u >"$HOST_BASE_URLS"
+    HOST_BASE_URLS="$host_out/context/urls_source.txt"
+    {
+      printf 'https://%s\n' "$host"
+      printf 'http://%s\n' "$host"
+    } | sort -u >"$HOST_BASE_URLS"
 
-  HOST_URLS="$host_out/url_input.txt"
-  if have httpx; then
-    run_step "httpx" "httpx" "$host_out" httpx -l "$HOST_BASE_URLS" -silent -o "$HOST_URLS" || true
-  else
-    print_skip "httpx (not installed)"
-    sort -u "$HOST_BASE_URLS" >"$HOST_URLS"
-  fi
+    HOST_HTTPX_RAW="$host_out/context/url_input.txt"
+    HOST_URLS="$host_out/context/live_urls.txt"
 
-  if [[ ! -s "$HOST_URLS" ]]; then
-    print_warn "httpx produced no URLs for ${host}; fallback to base urls"
-    sort -u "$HOST_BASE_URLS" >"$HOST_URLS"
-  fi
-
-  printf '%s\n' "$host" >"$host_out/target_host.txt"
-  BEST_URL="$(pick_best_url "$HOST_URLS" "$host")"
-  printf '%s\n' "$BEST_URL" >"$host_out/target_url.txt"
-
-KATANA_RAW="$host_out/katana.txt"
-KATANA_URLS="$host_out/katana_urls.txt"
-KATANA_HTTPX="$host_out/katana_httpx.txt"
-: >"$KATANA_RAW"
-: >"$KATANA_URLS"
-: >"$KATANA_HTTPX"
-
-if have katana; then
-  run_step "katana" "katana" "$host_out" katana -u "$BEST_URL" -silent -jc -o "$KATANA_RAW" || true
-  awk 'NF{print}' "$KATANA_RAW" | sed 's/\r$//' | sort -u >"$KATANA_URLS"
-else
-  print_skip "katana (not installed)"
-fi
-
-if have httpx && [[ -s "$KATANA_URLS" ]]; then
-  run_step "httpx (katana urls)" "httpx_katana" "$host_out" \
-    httpx -l "$KATANA_URLS" -silent -sc -cl -title -o "$KATANA_HTTPX" || true
-fi
-
-if [[ -s "$KATANA_URLS" ]]; then
-  kcnt="$(wc -l <"$KATANA_URLS" | tr -d ' ')"
-  print_done "katana urls: $kcnt"
-  log_line "katana urls: $kcnt"
-fi
-
-  if have nuclei; then
-    run_step "nuclei" "nuclei" "$host_out" nuclei \
-      -l "$HOST_URLS" \
-      -severity low,medium,high,critical \
-      -stats \
-      -jsonl \
-      -o "$host_out/nuclei.jsonl" \
-      -rl 150 \
-      -c 50 \
-      -timeout 10 \
-      -retries 2 || true
-  else
-    print_skip "nuclei (not installed)"
-  fi
-
-  if have nmap; then
-    run_step "nmap" "nmap" "$host_out" nmap -sS -sV -sC -T3 -p 80,443 -oA "$host_out/nmap_web" "$host" || true
-  else
-    print_skip "nmap (not installed)"
-  fi
-
-if have nikto; then
-  nikto_json="$host_out/nikto.json"
-  rm -f "$nikto_json" 2>/dev/null || true
-
-  run_step "nikto" "nikto" "$host_out" --soft-rcs "1" \
-    nikto -h "$BEST_URL" -Format json -output "$nikto_json" || true
-
-  if [[ ! -s "$nikto_json" ]]; then
-    print_warn "nikto json empty"
-    log_line "WARN: nikto json empty"
-  fi
-else
-  print_skip "nikto (not installed)"
-fi
-
-if have sslscan; then
-  if [[ "$BEST_URL" == https://* ]]; then
-    ssl_h="$(url_host "$BEST_URL")"
-    run_step "sslscan" "sslscan" "$host_out" sslscan --xml="$host_out/sslscan.xml" "$ssl_h" || true
-  else
-    print_skip "sslscan (BEST_URL is not https)"
-  fi
-else
-  print_skip "sslscan (not installed)"
-fi
-
-  if have ffuf; then
-    run_step "ffuf dirs" "ffuf_dirs" "$host_out" ffuf \
-      -u "${BEST_URL%/}/FUZZ" \
-      -w /usr/share/seclists/Discovery/Web-Content/common.txt \
-      -mc 200,204,301,302,307,401,403 \
-      -of csv -o "$host_out/ffuf_dirs.csv" || true
-
-    run_step "ffuf files" "ffuf_files" "$host_out" ffuf \
-      -u "${BEST_URL%/}/FUZZ" \
-      -w /usr/share/seclists/Discovery/Web-Content/raft-small-files.txt \
-      -mc 200,204,301,302 \
-      -of csv -o "$host_out/ffuf_files.csv" || true
-  else
-    print_skip "ffuf (not installed)"
-  fi
-  
-if have ffuf && [[ -s "$KATANA_HTTPX" ]]; then
-  KATANA_DIRS="$host_out/katana_dirs.txt"
-
-  awk -v h="$host" '
-    NF {
-      u=$1
-      if (u ~ "^https?://" h "(/|$)" && $0 ~ /\[(200|204|301|302|307|401|403)\]/) {
-        sub(/[?#].*$/,"",u)
-        if (u ~ /\/[^\/]*$/) sub(/\/[^\/]*$/,"/",u)
-        if (u ~ /^https?:\/\/[^\/]+\/.*/) print u
-      }
-    }
-  ' "$KATANA_HTTPX" | sort -u | head -n 50 >"$KATANA_DIRS"
-
-  if [[ -s "$KATANA_DIRS" ]]; then
-    run_step "ffuf (katana dirs)" "ffuf_katana_dirs" "$host_out" ffuf \
-      -u "FUZZFUZZ2" \
-      -w "$KATANA_DIRS":FUZZ \
-      -w /usr/share/seclists/Discovery/Web-Content/common.txt:FUZZ2 \
-      -mc 200,204,301,302,307,401,403 \
-      -of csv -o "$host_out/ffuf_katana_dirs.csv" || true
-  else
-    print_warn "ffuf (katana dirs) no dirs extracted"
-  fi
-else
-  print_skip "ffuf (katana dirs) (no katana_httpx)"
-fi
-
-  if have feroxbuster; then
-    export STATE_FILENAME="$host_out/ferox-stdin-data.state"
-    run_step "feroxbuster" "feroxbuster" "$host_out" feroxbuster \
-      -u "$BEST_URL" \
-      -w /usr/share/seclists/Discovery/Web-Content/common.txt \
-      -s 200 204 301 302 307 401 403 \
-      --quiet \
-      -o "$host_out/feroxbuster.txt" || true
-    unset STATE_FILENAME
-  else
-    print_skip "feroxbuster (not installed)"
-  fi
-
-  SUB_WORK="$host_out/subdomains_work"
-  mkdir -p "$SUB_WORK"
-
-  if have subfinder; then
-    run_step "subfinder" "subfinder" "$host_out" subfinder -d "$host" -silent -o "$SUB_WORK/subfinder.txt" || true
-  else
-    print_skip "subfinder (not installed)"
-    : >"$SUB_WORK/subfinder.txt"
-  fi
-
-  BBOT_SUB="$SUB_WORK/bbot_subdomains.txt"
-  : >"$BBOT_SUB"
-
-  if have bbot; then
-    BBOT_OUT="$SUB_WORK/bbot_out"
-    mkdir -p "$BBOT_OUT"
-    run_step "bbot" "bbot" "$host_out" bbot -t "$host" -f subdomain-enum -rf passive -y -n "bbot" -o "$BBOT_OUT" || true
-    found_bbot_sub="$(find "$BBOT_OUT" -type f -name 'subdomains.txt' 2>/dev/null | head -n 1 || true)"
-    if [[ -n "$found_bbot_sub" && -s "$found_bbot_sub" ]]; then
-      sort -u "$found_bbot_sub" >"$BBOT_SUB"
-      print_done "bbot subdomains -> bbot_subdomains.txt"
-      log_line "DONE: bbot subdomains -> ${BBOT_SUB}"
+    if have httpx; then
+      run_step "httpx" "httpx" "$host_out" httpx \
+        -l "$HOST_BASE_URLS" \
+        -silent \
+        -sc \
+        -cl \
+        -title \
+        -tech-detect \
+        -follow-host-redirects \
+        -ports "$WEB_PORTS" \
+        -rl "$HTTPX_RL" \
+        -o "$HOST_HTTPX_RAW" || true
+      normalize_httpx_urls "$HOST_HTTPX_RAW" "$HOST_URLS"
     else
-      print_warn "bbot subdomains (none found)"
-      log_line "WARN: bbot subdomains none found"
+      print_skip "httpx (not installed)"
+      sort -u "$HOST_BASE_URLS" >"$HOST_URLS"
     fi
-    rm -rf "$BBOT_OUT" 2>/dev/null || true
-  else
-    print_skip "bbot (not installed)"
-  fi
 
-  SUBS_COMBINED="$host_out/subdomains.txt"
-  {
-    cat "$SUB_WORK/subfinder.txt" 2>/dev/null || true
-    cat "$BBOT_SUB" 2>/dev/null || true
-  } | awk 'NF{print}' | sed 's/\r$//' | sort -u >"$SUBS_COMBINED"
-  print_done "subdomains -> subdomains.txt"
-  log_line "DONE: subdomains -> ${SUBS_COMBINED}"
+    if [[ ! -s "$HOST_URLS" ]]; then
+      print_warn "httpx produced no URLs for ${host}; fallback to base urls"
+      sort -u "$HOST_BASE_URLS" >"$HOST_URLS"
+    fi
 
-  cp -f "$SUB_WORK/subfinder.txt" "$host_out/subfinder.txt" 2>/dev/null || true
-  cp -f "$BBOT_SUB" "$host_out/bbot_subdomains.txt" 2>/dev/null || true
-  rm -rf "$SUB_WORK" 2>/dev/null || true
+    printf '%s\n' "$host" >"$host_out/context/target_host.txt"
+    BEST_URL="$(pick_best_url "$HOST_URLS" "$host")"
+    printf '%s\n' "$BEST_URL" >"$host_out/context/target_url.txt"
 
-  if have subzy; then
-    run_step "subzy" "subzy" "$host_out" subzy run --targets "$SUBS_COMBINED" --output "$host_out/subzy.json" || true
-  else
-    print_skip "subzy (not installed)"
-  fi
+    KATANA_RAW="$host_out/context/katana.txt"
+    KATANA_URLS="$host_out/context/katana_urls.txt"
+    KATANA_HTTPX="$host_out/context/katana_httpx.txt"
+    : >"$KATANA_RAW"
+    : >"$KATANA_URLS"
+    : >"$KATANA_HTTPX"
 
-  print_done "Host report: $host_out"
+    if have katana; then
+      run_step "katana" "katana" "$host_out" katana \
+        -u "$BEST_URL" \
+        -silent \
+        -jc \
+        -kf all \
+        -fx \
+        -d "$KATANA_DEPTH" \
+        -o "$KATANA_RAW" || true
+      awk 'NF{print}' "$KATANA_RAW" | sed 's/\r$//' | grep -E '^https?://' | sort -u >"$KATANA_URLS" || true
+    else
+      print_skip "katana (not installed)"
+    fi
+
+    if have httpx && [[ -s "$KATANA_URLS" ]]; then
+      run_step "httpx (katana urls)" "httpx_katana" "$host_out" httpx \
+        -l "$KATANA_URLS" \
+        -silent \
+        -sc \
+        -cl \
+        -title \
+        -tech-detect \
+        -rl "$HTTPX_RL" \
+        -o "$KATANA_HTTPX" || true
+    fi
+
+    if [[ -s "$KATANA_URLS" ]]; then
+      kcnt="$(count_file "$KATANA_URLS")"
+      print_done "katana urls: $kcnt"
+      log_line "katana urls: $kcnt"
+    fi
+
+    WAYBACK_URLS="$host_out/context/waybackurls.txt"
+    GAU_URLS="$host_out/context/gau.txt"
+    : >"$WAYBACK_URLS"
+    : >"$GAU_URLS"
+
+    if have waybackurls; then
+      run_step "waybackurls" "waybackurls" "$host_out" \
+        bash -c "printf '%s\n' '$host' | waybackurls | sort -u > '$WAYBACK_URLS'" || true
+    else
+      print_skip "waybackurls (not installed)"
+    fi
+
+    if have gau; then
+      run_step "gau" "gau" "$host_out" \
+        bash -c "printf '%s\n' '$host' | gau | sort -u > '$GAU_URLS'" || true
+    else
+      print_skip "gau (not installed)"
+    fi
+
+    ALL_URLS="$host_out/context/all_urls.txt"
+    cat "$HOST_URLS" "$KATANA_URLS" "$WAYBACK_URLS" "$GAU_URLS" 2>/dev/null \
+      | awk 'NF{print}' \
+      | sed 's/\r$//' \
+      | sort -u >"$ALL_URLS"
+
+    extract_context_files "$host_out"
+
+    print_done "all urls: $(count_file "$ALL_URLS")"
+    print_done "interesting files: $(count_file "$host_out/context/interesting_files.txt")"
+    print_done "interesting params: $(count_file "$host_out/context/interesting_params.txt")"
+    print_done "api candidates: $(count_file "$host_out/context/api_candidates.txt")"
+    print_done "js files: $(count_file "$host_out/context/js_files.txt")"
+
+    if have nuclei; then
+      run_step "nuclei general" "nuclei_general" "$host_out" nuclei \
+        -l "$HOST_URLS" \
+        -severity low,medium,high,critical \
+        -stats \
+        -jsonl \
+        -o "$host_out/reports/nuclei.jsonl" \
+        -rl "$NUCLEI_RL" \
+        -c "$NUCLEI_C" \
+        -timeout 10 \
+        -retries 2 || true
+
+      run_step "nuclei exposures" "nuclei_exposures" "$host_out" nuclei \
+        -l "$HOST_URLS" \
+        -tags exposure,misconfig,files,logs,backup,config \
+        -jsonl \
+        -o "$host_out/reports/nuclei_exposures.jsonl" \
+        -rl "$NUCLEI_RL" \
+        -c "$NUCLEI_C" \
+        -timeout 10 \
+        -retries 2 || true
+
+      run_step "nuclei takeover" "nuclei_takeover" "$host_out" nuclei \
+        -l "$HOST_URLS" \
+        -tags takeover \
+        -jsonl \
+        -o "$host_out/reports/nuclei_takeover.jsonl" \
+        -rl "$NUCLEI_RL" \
+        -c "$NUCLEI_C" \
+        -timeout 10 \
+        -retries 2 || true
+
+      if [[ -s "$host_out/context/js_files.txt" ]]; then
+        run_step "nuclei js exposure" "nuclei_js_exposure" "$host_out" nuclei \
+          -l "$host_out/context/js_files.txt" \
+          -tags exposure,token,secret \
+          -jsonl \
+          -o "$host_out/reports/nuclei_js_exposure.jsonl" \
+          -rl "$NUCLEI_RL" \
+          -c "$NUCLEI_C" \
+          -timeout 10 \
+          -retries 2 || true
+      fi
+    else
+      print_skip "nuclei (not installed)"
+    fi
+
+    if [[ "$MODE" != "passive" ]]; then
+      if have nmap; then
+        run_step "nmap" "nmap" "$host_out" nmap \
+          -sS \
+          -sV \
+          -sC \
+          -T3 \
+          -p "$WEB_PORTS" \
+          -oA "$host_out/reports/nmap_web" \
+          "$host" || true
+      else
+        print_skip "nmap (not installed)"
+      fi
+    else
+      print_skip "nmap (passive mode)"
+    fi
+
+    if [[ "$MODE" != "passive" ]]; then
+      if have nikto; then
+        nikto_json="$host_out/reports/nikto.json"
+        rm -f "$nikto_json" 2>/dev/null || true
+
+        run_step "nikto" "nikto" "$host_out" --soft-rcs "1" \
+          nikto -h "$BEST_URL" -Format json -output "$nikto_json" || true
+
+        if [[ ! -s "$nikto_json" ]]; then
+          print_warn "nikto json empty"
+          log_line "WARN: nikto json empty"
+        fi
+      else
+        print_skip "nikto (not installed)"
+      fi
+    else
+      print_skip "nikto (passive mode)"
+    fi
+
+    if have sslscan; then
+      if [[ "$BEST_URL" == https://* ]]; then
+        ssl_h="$(url_host "$BEST_URL")"
+        run_step "sslscan" "sslscan" "$host_out" sslscan \
+          --xml="$host_out/reports/sslscan.xml" \
+          "$ssl_h" || true
+      else
+        print_skip "sslscan (BEST_URL is not https)"
+      fi
+    else
+      print_skip "sslscan (not installed)"
+    fi
+
+    if [[ "$MODE" != "passive" ]]; then
+      if have ffuf; then
+        run_step "ffuf dirs" "ffuf_dirs" "$host_out" ffuf \
+          -u "${BEST_URL%/}/FUZZ" \
+          -w "$DIR_WL" \
+          -mc 200,204,301,302,307,308,401,403,405,500 \
+          -ac \
+          -rate "$FFUF_RATE" \
+          -of csv \
+          -o "$host_out/reports/ffuf_dirs.csv" || true
+
+        run_step "ffuf files" "ffuf_files" "$host_out" ffuf \
+          -u "${BEST_URL%/}/FUZZ" \
+          -w "$FILE_WL" \
+          -e "$FFUF_EXTENSIONS" \
+          -mc 200,204,301,302,307,308,401,403,405,500 \
+          -ac \
+          -rate "$FFUF_RATE" \
+          -of csv \
+          -o "$host_out/reports/ffuf_files.csv" || true
+      else
+        print_skip "ffuf (not installed)"
+      fi
+    else
+      print_skip "ffuf dirs/files (passive mode)"
+    fi
+
+    KATANA_DIRS="$host_out/context/katana_dirs.txt"
+    : >"$KATANA_DIRS"
+
+    if [[ -s "$KATANA_HTTPX" ]]; then
+      awk -v h="$host" '
+        NF {
+          u=$1
+          if (u ~ "^https?://" h "(:[0-9]+)?(/|$)" && $0 ~ /\[(200|204|301|302|307|308|401|403|405|500)\]/) {
+            sub(/[?#].*$/,"",u)
+            if (u ~ /\/[^\/]*$/) sub(/\/[^\/]*$/,"/",u)
+            if (u ~ /^https?:\/\/[^\/]+\/.*/) print u
+          }
+        }
+      ' "$KATANA_HTTPX" | sort -u | head -n 50 >"$KATANA_DIRS"
+    fi
+
+    if [[ "$MODE" != "passive" ]]; then
+      if have ffuf && [[ -s "$KATANA_DIRS" ]]; then
+        run_step "ffuf (katana dirs)" "ffuf_katana_dirs" "$host_out" ffuf \
+          -u "FUZZFUZZ2" \
+          -w "$KATANA_DIRS":FUZZ \
+          -w "$WL_COMMON":FUZZ2 \
+          -mc 200,204,301,302,307,308,401,403,405,500 \
+          -ac \
+          -rate "$FFUF_RATE" \
+          -of csv \
+          -o "$host_out/reports/ffuf_katana_dirs.csv" || true
+      else
+        print_skip "ffuf (katana dirs)"
+      fi
+    else
+      print_skip "ffuf (katana dirs) (passive mode)"
+    fi
+
+    if [[ "$MODE" != "passive" ]]; then
+      if have feroxbuster; then
+        export STATE_FILENAME="$host_out/tmp/ferox-stdin-data.state"
+        run_step "feroxbuster" "feroxbuster" "$host_out" feroxbuster \
+          -u "$BEST_URL" \
+          -w "$DIR_WL" \
+          -x "$EXTENSIONS" \
+          -s 200,204,301,302,307,308,401,403,405,500 \
+          -k \
+          --random-agent \
+          --rate-limit "$FEROX_RL" \
+          --depth "$FEROX_DEPTH" \
+          --collect-words \
+          --collect-backups \
+          --quiet \
+          -o "$host_out/reports/feroxbuster.txt" || true
+        unset STATE_FILENAME
+      else
+        print_skip "feroxbuster (not installed)"
+      fi
+    else
+      print_skip "feroxbuster (passive mode)"
+    fi
+
+    if have gowitness; then
+      mkdir -p "$host_out/reports/gowitness"
+      run_step "gowitness" "gowitness" "$host_out" gowitness scan file \
+        -f "$HOST_URLS" \
+        --write-db \
+        --screenshot-path "$host_out/reports/gowitness" || true
+    else
+      print_skip "gowitness (not installed)"
+    fi
+
+    SUB_WORK="$host_out/tmp/subdomains_work"
+    mkdir -p "$SUB_WORK"
+
+    if have subfinder; then
+      run_step "subfinder" "subfinder" "$host_out" subfinder \
+        -d "$host" \
+        -silent \
+        -o "$SUB_WORK/subfinder.txt" || true
+    else
+      print_skip "subfinder (not installed)"
+      : >"$SUB_WORK/subfinder.txt"
+    fi
+
+    BBOT_SUB="$SUB_WORK/bbot_subdomains.txt"
+    : >"$BBOT_SUB"
+
+    if have bbot; then
+      BBOT_OUT="$SUB_WORK/bbot_out"
+      mkdir -p "$BBOT_OUT"
+      run_step "bbot" "bbot" "$host_out" bbot \
+        -t "$host" \
+        -f subdomain-enum \
+        -rf passive \
+        -y \
+        -n "bbot" \
+        -o "$BBOT_OUT" || true
+      found_bbot_sub="$(find "$BBOT_OUT" -type f -name 'subdomains.txt' 2>/dev/null | head -n 1 || true)"
+      if [[ -n "$found_bbot_sub" && -s "$found_bbot_sub" ]]; then
+        sort -u "$found_bbot_sub" >"$BBOT_SUB"
+        print_done "bbot subdomains -> bbot_subdomains.txt"
+        log_line "DONE: bbot subdomains -> ${BBOT_SUB}"
+      else
+        print_warn "bbot subdomains (none found)"
+        log_line "WARN: bbot subdomains none found"
+      fi
+    else
+      print_skip "bbot (not installed)"
+    fi
+
+    SUBS_COMBINED="$host_out/context/subdomains.txt"
+    {
+      cat "$SUB_WORK/subfinder.txt" 2>/dev/null || true
+      cat "$BBOT_SUB" 2>/dev/null || true
+    } | awk 'NF{print}' | sed 's/\r$//' | sort -u >"$SUBS_COMBINED"
+
+    cp -f "$SUB_WORK/subfinder.txt" "$host_out/context/subfinder.txt" 2>/dev/null || true
+    cp -f "$BBOT_SUB" "$host_out/context/bbot_subdomains.txt" 2>/dev/null || true
+
+    print_done "subdomains -> context/subdomains.txt"
+    log_line "DONE: subdomains -> ${SUBS_COMBINED}"
+
+    if have subzy; then
+      if [[ -s "$SUBS_COMBINED" ]]; then
+        run_step "subzy" "subzy" "$host_out" subzy run \
+          --targets "$SUBS_COMBINED" \
+          --output "$host_out/reports/subzy.json" || true
+      else
+        print_skip "subzy (no subdomains)"
+      fi
+    else
+      print_skip "subzy (not installed)"
+    fi
+
+    write_host_readme "$host_out" "$host"
+    print_done "Host report: $host_out"
   ) || {
     print_warn "Host failed: $host (see log)"
     log_line "HOST FAILED: $host"
@@ -476,6 +860,12 @@ ABS_LOG="$(cd "$(dirname "$LOG")" && pwd -P)/$(basename "$LOG")"
 
 printf '\n%s==== SUMMARY ====%s\n' "$BLU" "$RST"
 printf '%sTargets:%s %s host(s)\n' "$GRN" "$RST" "$TOTAL_HOSTS"
+printf '%sMode:%s %s\n' "$GRN" "$RST" "$MODE"
 printf '%sReport folder:%s %s\n' "$GRN" "$RST" "$ABS_RUN_DIR"
 printf '%sLog:%s %s\n' "$GRN" "$RST" "$ABS_LOG"
+
+if [[ "$SUMMARY_MOVED_FEROX" -eq 1 ]]; then
+  printf '%sMisc leftovers:%s %s\n' "$YEL" "$RST" "$SUMMARY_MISC_DIR"
+fi
+
 printf '%s' "$RST"
