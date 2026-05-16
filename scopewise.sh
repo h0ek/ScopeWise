@@ -2,15 +2,16 @@
 set -euo pipefail
 
 APP_NAME="scopewise"
-APP_VER="0.2.4"
+APP_VER="0.2.7"
 
 MODE="fast"
 TARGET_SINGLE=""
 TARGET_FILE=""
 
-WEB_PORTS="80,443,8080,8443,8000,8888,3000,5000,9000"
-EXTENSIONS="php,html,js,json,xml,txt,log,bak,backup,old,zip,tar,gz,tgz,sql,db,sqlite,env,config,conf,ini,yml,yaml,map"
-FFUF_EXTENSIONS=".php,.html,.js,.json,.xml,.txt,.log,.bak,.backup,.old,.zip,.tar.gz,.tgz,.sql,.db,.sqlite,.env,.config,.conf,.ini,.yml,.yaml,.map"
+WEB_PORTS="80,443"
+WEB_PORTS_DEEP="80,443,8080,8443,8000,8888,3000,5000,9000"
+EXTENSIONS="js,json,xml,txt,log,bak,backup,old,zip,tar,gz,tgz,sql,db,sqlite,env,config,conf,ini,yml,yaml,map"
+FFUF_EXTENSIONS=".js,.json,.xml,.txt,.log,.bak,.backup,.old,.zip,.tar.gz,.tgz,.sql,.db,.sqlite,.env,.config,.conf,.ini,.yml,.yaml,.map"
 
 WL_COMMON="/usr/share/seclists/Discovery/Web-Content/common.txt"
 WL_DIR_SMALL="/usr/share/seclists/Discovery/Web-Content/raft-small-directories.txt"
@@ -21,9 +22,9 @@ WL_FILE_MEDIUM="/usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt"
 banner() {
 cat <<'EOF_BANNER'
 
-\u2584\u2588\u2588\u2588\u2588\u2588  \u2584\u2584\u2584\u2584  \u2584\u2584\u2584  \u2584\u2584\u2584\u2584  \u2584\u2584\u2584\u2584\u2584 \u2588\u2588     \u2588\u2588 \u2584\u2584  \u2584\u2584\u2584\u2584 \u2584\u2584\u2584\u2584\u2584
-\u2580\u2580\u2580\u2584\u2584\u2584 \u2588\u2588\u2580\u2580\u2580 \u2588\u2588\u2580\u2588\u2588 \u2588\u2588\u2584\u2588\u2580 \u2588\u2588\u2584\u2584  \u2588\u2588 \u2584\u2588\u2584 \u2588\u2588 \u2588\u2588 \u2588\u2588\u2588\u2584\u2584 \u2588\u2588\u2584\u2584
-\u2588\u2588\u2588\u2588\u2588\u2580 \u2580\u2588\u2588\u2588\u2588 \u2580\u2588\u2588\u2588\u2580 \u2588\u2588    \u2588\u2588\u2584\u2584\u2584  \u2580\u2588\u2588\u2580\u2588\u2588\u2580  \u2588\u2588 \u2584\u2584\u2588\u2588\u2580 \u2588\u2588\u2584\u2584\u2584
+▄█████  ▄▄▄▄  ▄▄▄  ▄▄▄▄  ▄▄▄▄▄ ██     ██ ▄▄  ▄▄▄▄ ▄▄▄▄▄ 
+▀▀▀▄▄▄ ██▀▀▀ ██▀██ ██▄█▀ ██▄▄  ██ ▄█▄ ██ ██ ███▄▄ ██▄▄  
+█████▀ ▀████ ▀███▀ ██    ██▄▄▄  ▀██▀██▀  ██ ▄▄██▀ ██▄▄▄ 
 
 EOF_BANNER
 printf '  %s v%s\n\n' "$APP_NAME" "$APP_VER"
@@ -107,6 +108,43 @@ print_warn() { printf '\r\033[K%s[WARN]%s  %s\n' "$YEL" "$RST" "$1"; }
 print_fail() { printf '\r\033[K%s[FAIL]%s  %s\n' "$RED" "$RST" "$1"; }
 print_skip() { printf '\r\033[K%s[SKIP]%s  %s\n' "$YEL" "$RST" "$1"; }
 
+format_duration() {
+  local total="${1:-0}"
+  local h=$((total / 3600))
+  local m=$(((total % 3600) / 60))
+  local sec=$((total % 60))
+  printf '%02d:%02d:%02d' "$h" "$m" "$sec"
+}
+
+write_fast_file_wordlist() {
+  local output="$1"
+  cat >"$output" <<'EOF_FAST_FILES'
+.env
+.env.local
+.env.production
+.git/HEAD
+.git/config
+config.json
+config.yml
+config.yaml
+appsettings.json
+web.config
+backup.zip
+backup.tar.gz
+backup.sql
+dump.sql
+database.sql
+debug.log
+error.log
+access.log
+swagger.json
+openapi.json
+robots.txt
+sitemap.xml
+server-status
+EOF_FAST_FILES
+}
+
 trap_int() { INT_SKIP=1; }
 trap 'trap_int' INT
 
@@ -125,6 +163,10 @@ run_step() {
   mkdir -p "${host_out}/debug"
   local stdout_file="${host_out}/debug/${tool}.stdout"
   local stderr_file="${host_out}/debug/${tool}.stderr"
+  local start_ts
+  local elapsed
+  local pretty_elapsed
+  start_ts="$(date +%s)"
 
   INT_SKIP=0
   log_line "START: ${label}"
@@ -139,8 +181,9 @@ run_step() {
       sleep 0.2
       kill -KILL "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
-      log_line "SKIP: ${label}"
-      print_skip "$label"
+      elapsed=$(( $(date +%s) - start_ts ))
+      log_line "SKIP: ${label} ($(format_duration "$elapsed"))"
+      print_skip "${label} ($(format_duration "$elapsed"))"
       return 130
     fi
     spin_tick "$label"
@@ -149,10 +192,12 @@ run_step() {
 
   local rc=0
   wait "$pid" || rc=$?
+  elapsed=$(( $(date +%s) - start_ts ))
+  pretty_elapsed="$(format_duration "$elapsed")"
 
   if [[ "$rc" -eq 0 ]]; then
-    log_line "DONE: ${label}"
-    print_done "$label"
+    log_line "DONE: ${label} (${pretty_elapsed})"
+    print_done "${label} (${pretty_elapsed})"
     return 0
   fi
 
@@ -173,12 +218,12 @@ run_step() {
   fi
 
   if [[ "$is_soft" -eq 1 ]]; then
-    log_line "SOFT-RC: ${label} rc=${rc}"
-    print_done "${label} (soft rc=${rc})"
+    log_line "SOFT-RC: ${label} rc=${rc} (${pretty_elapsed})"
+    print_done "${label} (soft rc=${rc}, ${pretty_elapsed})"
     return 0
   else
-    log_line "RC: ${label} rc=${rc}"
-    print_warn "${label} (rc=${rc})"
+    log_line "RC: ${label} rc=${rc} (${pretty_elapsed})"
+    print_warn "${label} (rc=${rc}, ${pretty_elapsed})"
     return "$rc"
   fi
 }
@@ -251,17 +296,20 @@ parse_args() {
 configure_mode() {
   case "$MODE" in
     fast)
+      WEB_PORTS="80,443"
       HTTPX_RL="80"
       NUCLEI_RL="30"
       NUCLEI_C="10"
-      KATANA_DEPTH="3"
-      FEROX_RL="30"
-      FEROX_DEPTH="2"
-      FFUF_RATE="30"
-      DIR_WL="$(choose_wordlist "$WL_DIR_SMALL" "$WL_COMMON")"
-      FILE_WL="$(choose_wordlist "$WL_FILE_SMALL" "$WL_COMMON")"
+      KATANA_DEPTH="2"
+      FEROX_RL="25"
+      FEROX_DEPTH="1"
+      FFUF_RATE="50"
+      DIR_WL="$(choose_wordlist "$WL_COMMON" "$WL_DIR_SMALL")"
+      FILE_WL="__FAST_CRITICAL_FILES__"
+      KATANA_DIR_LIMIT="15"
       ;;
     deep)
+      WEB_PORTS="$WEB_PORTS_DEEP"
       HTTPX_RL="80"
       NUCLEI_RL="40"
       NUCLEI_C="15"
@@ -269,10 +317,12 @@ configure_mode() {
       FEROX_RL="20"
       FEROX_DEPTH="3"
       FFUF_RATE="20"
-      DIR_WL="$(choose_wordlist "$WL_DIR_MEDIUM" "$WL_COMMON")"
-      FILE_WL="$(choose_wordlist "$WL_FILE_MEDIUM" "$WL_COMMON")"
+      DIR_WL="$(choose_wordlist "$WL_DIR_SMALL" "$WL_COMMON")"
+      FILE_WL="$(choose_wordlist "$WL_FILE_SMALL" "$WL_COMMON")"
+      KATANA_DIR_LIMIT="50"
       ;;
     passive)
+      WEB_PORTS="80,443"
       HTTPX_RL="50"
       NUCLEI_RL="15"
       NUCLEI_C="5"
@@ -280,8 +330,9 @@ configure_mode() {
       FEROX_RL="0"
       FEROX_DEPTH="0"
       FFUF_RATE="0"
-      DIR_WL="$(choose_wordlist "$WL_DIR_SMALL" "$WL_COMMON")"
-      FILE_WL="$(choose_wordlist "$WL_FILE_SMALL" "$WL_COMMON")"
+      DIR_WL="$(choose_wordlist "$WL_COMMON" "$WL_DIR_SMALL")"
+      FILE_WL="__FAST_CRITICAL_FILES__"
+      KATANA_DIR_LIMIT="10"
       ;;
     *)
       print_fail "Invalid mode: $MODE"
@@ -340,6 +391,53 @@ extract_context_files() {
     | sort -u >"$host_out/context/sqli_candidates.txt" || true
 }
 
+
+validate_live_js_files() {
+  local host_out="$1"
+  local raw_js="$host_out/context/js_files_raw.txt"
+  local clean_js="$host_out/tmp/js_files_clean.txt"
+  local live_js="$host_out/context/js_files.txt"
+  local js_httpx="$host_out/context/js_httpx.txt"
+
+  cp -f "$live_js" "$raw_js" 2>/dev/null || : >"$raw_js"
+  : >"$clean_js"
+  : >"$js_httpx"
+
+  [[ -s "$raw_js" ]] || {
+    : >"$live_js"
+    return 0
+  }
+
+  # Drop obvious garbage from archived/generated URLs, especially encoded Windows-style backslashes.
+  grep -Eiv '(%5c|\\)' "$raw_js" | sort -u >"$clean_js" || true
+
+  if [[ ! -s "$clean_js" ]]; then
+    : >"$live_js"
+    print_warn "live js files: 0 (all candidates looked invalid/encoded)"
+    log_line "WARN: live js files: 0 after cleaning invalid JS candidates"
+    return 0
+  fi
+
+  if have httpx; then
+    run_step "httpx (js files)" "httpx_js" "$host_out" httpx \
+      -l "$clean_js" \
+      -silent \
+      -sc \
+      -cl \
+      -title \
+      -follow-host-redirects \
+      -rl "$HTTPX_RL" \
+      -o "$js_httpx" || true
+
+    awk '$0 ~ /\[(200|204|206|301|302|307|308)\]/ {print $1}' "$js_httpx" \
+      | grep -Ei '\.js($|\?)' \
+      | sort -u >"$live_js" || true
+  else
+    # Without httpx we cannot prove liveness, so keep the cleaned list only.
+    cp -f "$clean_js" "$live_js"
+  fi
+}
+
 count_file() {
   local f="$1"
   if [[ -s "$f" ]]; then
@@ -368,6 +466,8 @@ Review first:
   context/interesting_params.txt
   context/api_candidates.txt
   context/js_files.txt
+  context/js_files_raw.txt
+  context/js_httpx.txt
   context/source_maps.txt
   reports/feroxbuster.txt
   reports/ffuf_files.csv
@@ -406,6 +506,7 @@ EOF_README
 parse_args "$@"
 banner
 configure_mode
+RUN_START_TS="$(date +%s)"
 
 if [[ -z "${TARGET_SINGLE}" && -z "${TARGET_FILE}" ]]; then
   usage
@@ -483,6 +584,10 @@ for host in "${HOSTS[@]}"; do
 
     host_out="$OUT_DIR/$host"
     mkdir -p "$host_out/reports" "$host_out/context" "$host_out/debug" "$host_out/tmp"
+    if [[ "$FILE_WL" == "__FAST_CRITICAL_FILES__" ]]; then
+      FILE_WL="$host_out/tmp/critical-files.txt"
+      write_fast_file_wordlist "$FILE_WL"
+    fi
     log_line "HOST_OUT: $host_out"
 
     HOST_BASE_URLS="$host_out/context/urls_source.txt"
@@ -577,17 +682,19 @@ for host in "${HOSTS[@]}"; do
       | sort -u >"$ALL_URLS"
 
     extract_context_files "$host_out"
+    validate_live_js_files "$host_out"
 
     print_done "all urls: $(count_file "$ALL_URLS")"
     print_done "interesting files: $(count_file "$host_out/context/interesting_files.txt")"
     print_done "interesting params: $(count_file "$host_out/context/interesting_params.txt")"
     print_done "api candidates: $(count_file "$host_out/context/api_candidates.txt")"
-    print_done "js files: $(count_file "$host_out/context/js_files.txt")"
+    print_done "js candidates: $(count_file "$host_out/context/js_files_raw.txt")"
+    print_done "live js files: $(count_file "$host_out/context/js_files.txt")"
 
     if have nuclei; then
       run_step "nuclei general" "nuclei_general" "$host_out" nuclei \
         -l "$HOST_URLS" \
-        -severity low,medium,high,critical \
+        -severity medium,high,critical \
         -stats \
         -jsonl \
         -o "$host_out/reports/nuclei.jsonl" \
@@ -691,15 +798,26 @@ for host in "${HOSTS[@]}"; do
           -of csv \
           -o "$host_out/reports/ffuf_dirs.csv" || true
 
-        run_step "ffuf files" "ffuf_files" "$host_out" ffuf \
-          -u "${BEST_URL%/}/FUZZ" \
-          -w "$FILE_WL" \
-          -e "$FFUF_EXTENSIONS" \
-          -mc 200,204,301,302,307,308,401,403,405,500 \
-          -ac \
-          -rate "$FFUF_RATE" \
-          -of csv \
-          -o "$host_out/reports/ffuf_files.csv" || true
+        if [[ "$MODE" == "fast" || "$MODE" == "passive" ]]; then
+          run_step "ffuf files" "ffuf_files" "$host_out" ffuf \
+            -u "${BEST_URL%/}/FUZZ" \
+            -w "$FILE_WL" \
+            -mc 200,204,301,302,307,308,401,403,405,500 \
+            -ac \
+            -rate "$FFUF_RATE" \
+            -of csv \
+            -o "$host_out/reports/ffuf_files.csv" || true
+        else
+          run_step "ffuf files" "ffuf_files" "$host_out" ffuf \
+            -u "${BEST_URL%/}/FUZZ" \
+            -w "$FILE_WL" \
+            -e "$FFUF_EXTENSIONS" \
+            -mc 200,204,301,302,307,308,401,403,405,500 \
+            -ac \
+            -rate "$FFUF_RATE" \
+            -of csv \
+            -o "$host_out/reports/ffuf_files.csv" || true
+        fi
       else
         print_skip "ffuf (not installed)"
       fi
@@ -720,25 +838,32 @@ for host in "${HOSTS[@]}"; do
             if (u ~ /^https?:\/\/[^\/]+\/.*/) print u
           }
         }
-      ' "$KATANA_HTTPX" | sort -u | head -n 50 >"$KATANA_DIRS"
+      ' "$KATANA_HTTPX" | sort -u | head -n "$KATANA_DIR_LIMIT" >"$KATANA_DIRS"
     fi
 
-    if [[ "$MODE" != "passive" ]]; then
+    if [[ "$MODE" == "deep" ]]; then
       if have ffuf && [[ -s "$KATANA_DIRS" ]]; then
-        run_step "ffuf (katana dirs)" "ffuf_katana_dirs" "$host_out" ffuf \
-          -u "FUZZFUZZ2" \
-          -w "$KATANA_DIRS":FUZZ \
-          -w "$WL_COMMON":FUZZ2 \
-          -mc 200,204,301,302,307,308,401,403,405,500 \
-          -ac \
-          -rate "$FFUF_RATE" \
-          -of csv \
-          -o "$host_out/reports/ffuf_katana_dirs.csv" || true
+        run_step "ffuf (katana dirs)" "ffuf_katana_dirs" "$host_out" \
+          bash -c '
+            set -euo pipefail
+            : > "$1"
+            while IFS= read -r base_dir; do
+              [[ -n "$base_dir" ]] || continue
+              tmp_out="${1}.tmp.$RANDOM.csv"
+              ffuf -u "${base_dir%/}/FUZZ" -w "$2" \
+                -mc 200,204,301,302,307,308,401,403,405,500 \
+                -ac -rate "$3" -of csv -o "$tmp_out" >/dev/null 2>&1 || true
+              if [[ -s "$tmp_out" ]]; then
+                cat "$tmp_out" >> "$1"
+              fi
+              rm -f "$tmp_out"
+            done < "$4"
+          ' bash "$host_out/reports/ffuf_katana_dirs.csv" "$WL_COMMON" "$FFUF_RATE" "$KATANA_DIRS" || true
       else
         print_skip "ffuf (katana dirs)"
       fi
     else
-      print_skip "ffuf (katana dirs) (passive mode)"
+      print_skip "ffuf (katana dirs) (deep mode only)"
     fi
 
     if [[ "$MODE" != "passive" ]]; then
@@ -753,8 +878,6 @@ for host in "${HOSTS[@]}"; do
           --random-agent \
           --rate-limit "$FEROX_RL" \
           --depth "$FEROX_DEPTH" \
-          --collect-words \
-          --collect-backups \
           --quiet \
           -o "$host_out/reports/feroxbuster.txt" || true
         unset STATE_FILENAME
@@ -868,6 +991,8 @@ ABS_LOG="$(cd "$(dirname "$LOG")" && pwd -P)/$(basename "$LOG")"
 printf '\n%s==== SUMMARY ====%s\n' "$BLU" "$RST"
 printf '%sTargets:%s %s host(s)\n' "$GRN" "$RST" "$TOTAL_HOSTS"
 printf '%sMode:%s %s\n' "$GRN" "$RST" "$MODE"
+RUN_TOTAL_SECONDS=$(( $(date +%s) - RUN_START_TS ))
+printf '%sTotal time:%s %s\n' "$GRN" "$RST" "$(format_duration "$RUN_TOTAL_SECONDS")"
 printf '%sReport folder:%s %s\n' "$GRN" "$RST" "$ABS_RUN_DIR"
 printf '%sLog:%s %s\n' "$GRN" "$RST" "$ABS_LOG"
 
