@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_NAME="scopewise"
-APP_VER="0.2.7"
+APP_VER="0.2.10"
 
 MODE="fast"
 TARGET_SINGLE=""
@@ -11,6 +11,9 @@ TARGET_FILE=""
 WEB_PORTS="80,443"
 WEB_PORTS_DEEP="80,443,8080,8443,8000,8888,3000,5000,9000"
 EXTENSIONS="js,json,xml,txt,log,bak,backup,old,zip,tar,gz,tgz,sql,db,sqlite,env,config,conf,ini,yml,yaml,map"
+# Fast ferox keeps extension probing, but uses a smaller high-signal list.
+# JS is intentionally excluded here because JS discovery is handled by katana + live httpx validation.
+FEROX_FAST_EXTENSIONS="json,txt,log,bak,backup,old,zip,sql,db,sqlite,env,config,conf,ini,yml,yaml,map"
 FFUF_EXTENSIONS=".js,.json,.xml,.txt,.log,.bak,.backup,.old,.zip,.tar.gz,.tgz,.sql,.db,.sqlite,.env,.config,.conf,.ini,.yml,.yaml,.map"
 
 WL_COMMON="/usr/share/seclists/Discovery/Web-Content/common.txt"
@@ -143,6 +146,59 @@ robots.txt
 sitemap.xml
 server-status
 EOF_FAST_FILES
+}
+
+write_fast_katana_wordlist() {
+  local output="$1"
+  cat >"$output" <<'EOF_FAST_KATANA'
+admin
+login
+api
+assets
+static
+js
+css
+images
+img
+uploads
+upload
+backup
+backups
+config
+debug
+health
+status
+robots.txt
+sitemap.xml
+EOF_FAST_KATANA
+}
+
+filter_ferox_fast_output() {
+  local input="$1"
+  local output="$2"
+
+  [[ -s "$input" ]] || {
+    : >"$output"
+    return 0
+  }
+
+  # Remove obvious extension-probing noise caused by generated empty basenames, e.g.:
+  #   /cgi-bin/.json
+  #   /assets/.bak
+  # Keep useful hidden files such as .env and .git/config.
+  awk '
+    BEGIN {
+      noise_ext="(json|txt|log|bak|backup|old|zip|sql|db|sqlite|config|conf|ini|yml|yaml|map)"
+    }
+    {
+      line=$0
+      # Empty basename extension probes: /.json, /.bak, /.config, etc.
+      if (line ~ "/\\." noise_ext "([[:space:]]|$|[?#])") next
+      # Very common package-manager backup/extension noise from generated probes.
+      if (line ~ "/\\.package-lock\\.json\\.(bak|backup|old|sql|db|sqlite|zip|map)([[:space:]]|$|[?#])") next
+      print line
+    }
+  ' "$input" >"$output" || cp -f "$input" "$output"
 }
 
 trap_int() { INT_SKIP=1; }
@@ -351,46 +407,119 @@ normalize_httpx_urls() {
   fi
 }
 
+clean_url_list() {
+  local input="$1"
+  local output="$2"
+
+  if [[ -s "$input" ]]; then
+    awk 'NF{print $1}' "$input" \
+      | sed 's/\r$//' \
+      | grep -E '^https?://' \
+      | grep -Eiv '(%5c|\\|[[:space:]])' \
+      | sort -u >"$output" || true
+  else
+    : >"$output"
+  fi
+}
+
+validate_live_url_file() {
+  local label="$1"
+  local tool="$2"
+  local host_out="$3"
+  local input="$4"
+  local live_output="$5"
+  local httpx_output="$6"
+
+  : >"$live_output"
+  : >"$httpx_output"
+
+  [[ -s "$input" ]] || return 0
+
+  if have httpx; then
+    run_step "$label" "$tool" "$host_out" httpx \
+      -l "$input" \
+      -silent \
+      -sc \
+      -cl \
+      -title \
+      -follow-host-redirects \
+      -rl "$HTTPX_RL" \
+      -o "$httpx_output" || true
+
+    awk '$0 ~ /\[(200|204|206|301|302|307|308|401|403)\]/ {print $1}' "$httpx_output" \
+      | grep -E '^https?://' \
+      | sort -u >"$live_output" || true
+  else
+    cp -f "$input" "$live_output"
+  fi
+}
+
 extract_context_files() {
   local host_out="$1"
-  local all_urls="$host_out/context/all_urls.txt"
+  local all_urls_raw="$host_out/context/all_urls_raw.txt"
 
+  : >"$host_out/context/interesting_files_raw.txt"
+  : >"$host_out/context/interesting_files_live.txt"
   : >"$host_out/context/interesting_files.txt"
   : >"$host_out/context/interesting_params.txt"
+  : >"$host_out/context/api_candidates_raw.txt"
+  : >"$host_out/context/api_candidates_live.txt"
   : >"$host_out/context/api_candidates.txt"
+  : >"$host_out/context/js_files_raw.txt"
   : >"$host_out/context/js_files.txt"
   : >"$host_out/context/source_maps.txt"
   : >"$host_out/context/redirect_candidates.txt"
   : >"$host_out/context/lfi_candidates.txt"
   : >"$host_out/context/sqli_candidates.txt"
 
-  [[ -s "$all_urls" ]] || return 0
+  [[ -s "$all_urls_raw" ]] || return 0
 
-  grep -Ei '\.env($|\?)|\.bak($|\?)|\.backup($|\?)|\.old($|\?)|\.zip($|\?)|\.tar($|\?)|\.gz($|\?)|\.tgz($|\?)|\.rar($|\?)|\.7z($|\?)|\.sql($|\?)|\.db($|\?)|\.sqlite($|\?)|\.log($|\?)|\.config($|\?)|\.conf($|\?)|\.ini($|\?)|\.yml($|\?)|\.yaml($|\?)|\.json($|\?)|\.map($|\?)' "$all_urls" \
-    | sort -u >"$host_out/context/interesting_files.txt" || true
+  grep -Ei '\.env($|\?)|\.bak($|\?)|\.backup($|\?)|\.old($|\?)|\.zip($|\?)|\.tar($|\?)|\.gz($|\?)|\.tgz($|\?)|\.rar($|\?)|\.7z($|\?)|\.sql($|\?)|\.db($|\?)|\.sqlite($|\?)|\.log($|\?)|\.config($|\?)|\.conf($|\?)|\.ini($|\?)|\.yml($|\?)|\.yaml($|\?)|\.json($|\?)|\.map($|\?)' "$all_urls_raw" \
+    | sort -u >"$host_out/context/interesting_files_raw.txt" || true
 
-  grep -Ei 'redirect=|url=|next=|return=|dest=|destination=|continue=|callback=|file=|path=|folder=|doc=|document=|template=|page=|id=|user=|account=|debug=|token=|key=|secret=|api' "$all_urls" \
+  grep -Ei 'redirect=|url=|next=|return=|dest=|destination=|continue=|callback=|file=|path=|folder=|doc=|document=|template=|page=|id=|user=|account=|debug=|token=|key=|secret=|api' "$all_urls_raw" \
     | sort -u >"$host_out/context/interesting_params.txt" || true
 
-  grep -Ei '/api/|/v1/|/v2/|/v3/|graphql|graphiql|swagger|openapi|api-docs|swagger-ui' "$all_urls" \
-    | sort -u >"$host_out/context/api_candidates.txt" || true
+  grep -Ei '/api/|/v1/|/v2/|/v3/|graphql|graphiql|swagger|openapi|api-docs|swagger-ui' "$all_urls_raw" \
+    | sort -u >"$host_out/context/api_candidates_raw.txt" || true
 
-  grep -Ei '\.js($|\?)' "$all_urls" \
-    | sort -u >"$host_out/context/js_files.txt" || true
+  grep -Ei '\.js($|\?)' "$all_urls_raw" \
+    | sort -u >"$host_out/context/js_files_raw.txt" || true
 
-  grep -Ei '\.map($|\?)' "$all_urls" \
+  grep -Ei '\.map($|\?)' "$all_urls_raw" \
     | sort -u >"$host_out/context/source_maps.txt" || true
 
-  grep -Ei 'redirect=|url=|next=|return=|dest=|destination=|continue=' "$all_urls" \
+  grep -Ei 'redirect=|url=|next=|return=|dest=|destination=|continue=' "$all_urls_raw" \
     | sort -u >"$host_out/context/redirect_candidates.txt" || true
 
-  grep -Ei 'file=|path=|folder=|doc=|document=|template=|page=' "$all_urls" \
+  grep -Ei 'file=|path=|folder=|doc=|document=|template=|page=' "$all_urls_raw" \
     | sort -u >"$host_out/context/lfi_candidates.txt" || true
 
-  grep -Ei 'id=|user=|account=|product=|item=|category=|search=|q=' "$all_urls" \
+  grep -Ei 'id=|user=|account=|product=|item=|category=|search=|q=' "$all_urls_raw" \
     | sort -u >"$host_out/context/sqli_candidates.txt" || true
 }
 
+validate_live_context_files() {
+  local host_out="$1"
+  local interesting_clean="$host_out/tmp/interesting_files_clean.txt"
+  local api_clean="$host_out/tmp/api_candidates_clean.txt"
+
+  clean_url_list "$host_out/context/interesting_files_raw.txt" "$interesting_clean"
+  clean_url_list "$host_out/context/api_candidates_raw.txt" "$api_clean"
+
+  validate_live_url_file "httpx (interesting files)" "httpx_interesting_files" "$host_out" \
+    "$interesting_clean" \
+    "$host_out/context/interesting_files_live.txt" \
+    "$host_out/context/interesting_files_httpx.txt"
+
+  validate_live_url_file "httpx (api candidates)" "httpx_api_candidates" "$host_out" \
+    "$api_clean" \
+    "$host_out/context/api_candidates_live.txt" \
+    "$host_out/context/api_candidates_httpx.txt"
+
+  cp -f "$host_out/context/interesting_files_live.txt" "$host_out/context/interesting_files.txt"
+  cp -f "$host_out/context/api_candidates_live.txt" "$host_out/context/api_candidates.txt"
+}
 
 validate_live_js_files() {
   local host_out="$1"
@@ -399,24 +528,13 @@ validate_live_js_files() {
   local live_js="$host_out/context/js_files.txt"
   local js_httpx="$host_out/context/js_httpx.txt"
 
-  cp -f "$live_js" "$raw_js" 2>/dev/null || : >"$raw_js"
-  : >"$clean_js"
+  clean_url_list "$raw_js" "$clean_js"
   : >"$js_httpx"
 
-  [[ -s "$raw_js" ]] || {
+  [[ -s "$clean_js" ]] || {
     : >"$live_js"
     return 0
   }
-
-  # Drop obvious garbage from archived/generated URLs, especially encoded Windows-style backslashes.
-  grep -Eiv '(%5c|\\)' "$raw_js" | sort -u >"$clean_js" || true
-
-  if [[ ! -s "$clean_js" ]]; then
-    : >"$live_js"
-    print_warn "live js files: 0 (all candidates looked invalid/encoded)"
-    log_line "WARN: live js files: 0 after cleaning invalid JS candidates"
-    return 0
-  fi
 
   if have httpx; then
     run_step "httpx (js files)" "httpx_js" "$host_out" httpx \
@@ -433,7 +551,6 @@ validate_live_js_files() {
       | grep -Ei '\.js($|\?)' \
       | sort -u >"$live_js" || true
   else
-    # Without httpx we cannot prove liveness, so keep the cleaned list only.
     cp -f "$clean_js" "$live_js"
   fi
 }
@@ -462,10 +579,12 @@ Review first:
   reports/nikto.json
   reports/nmap_web.xml
   reports/sslscan.xml
-  context/interesting_files.txt
-  context/interesting_params.txt
-  context/api_candidates.txt
+  context/interesting_files_live.txt
+  context/api_candidates_live.txt
   context/js_files.txt
+  context/interesting_params.txt
+  context/interesting_files_raw.txt
+  context/api_candidates_raw.txt
   context/js_files_raw.txt
   context/js_httpx.txt
   context/source_maps.txt
@@ -490,6 +609,8 @@ Manual queues:
   context/sqli_candidates.txt
 
 Context:
+  context/all_urls_raw.txt
+  context/all_urls_live.txt
   context/all_urls.txt
   context/live_urls.txt
   context/katana_urls.txt
@@ -675,19 +796,35 @@ for host in "${HOSTS[@]}"; do
       print_skip "waybackurls (not installed)"
     fi
 
+    ALL_URLS_RAW="$host_out/context/all_urls_raw.txt"
+    ALL_URLS_LIVE="$host_out/context/all_urls_live.txt"
     ALL_URLS="$host_out/context/all_urls.txt"
+    ALL_URLS_CLEAN="$host_out/tmp/all_urls_clean.txt"
+    ALL_URLS_HTTPX="$host_out/context/all_urls_httpx.txt"
+
     cat "$HOST_URLS" "$KATANA_URLS" "$WAYBACK_URLS" 2>/dev/null \
       | awk 'NF{print}' \
       | sed 's/\r$//' \
-      | sort -u >"$ALL_URLS"
+      | sort -u >"$ALL_URLS_RAW"
+
+    # Backward-compatible alias: all_urls.txt remains the raw/full URL set.
+    cp -f "$ALL_URLS_RAW" "$ALL_URLS"
+
+    clean_url_list "$ALL_URLS_RAW" "$ALL_URLS_CLEAN"
+    validate_live_url_file "httpx (all urls)" "httpx_all_urls" "$host_out" \
+      "$ALL_URLS_CLEAN" "$ALL_URLS_LIVE" "$ALL_URLS_HTTPX"
 
     extract_context_files "$host_out"
+    validate_live_context_files "$host_out"
     validate_live_js_files "$host_out"
 
-    print_done "all urls: $(count_file "$ALL_URLS")"
-    print_done "interesting files: $(count_file "$host_out/context/interesting_files.txt")"
+    print_done "all urls raw: $(count_file "$ALL_URLS_RAW")"
+    print_done "all urls live: $(count_file "$ALL_URLS_LIVE")"
+    print_done "interesting files raw: $(count_file "$host_out/context/interesting_files_raw.txt")"
+    print_done "interesting files live: $(count_file "$host_out/context/interesting_files_live.txt")"
     print_done "interesting params: $(count_file "$host_out/context/interesting_params.txt")"
-    print_done "api candidates: $(count_file "$host_out/context/api_candidates.txt")"
+    print_done "api candidates raw: $(count_file "$host_out/context/api_candidates_raw.txt")"
+    print_done "api candidates live: $(count_file "$host_out/context/api_candidates_live.txt")"
     print_done "js candidates: $(count_file "$host_out/context/js_files_raw.txt")"
     print_done "live js files: $(count_file "$host_out/context/js_files.txt")"
 
@@ -757,11 +894,18 @@ for host in "${HOSTS[@]}"; do
 
     if [[ "$MODE" != "passive" ]]; then
       if have nikto; then
+        nikto_base="$host_out/reports/nikto"
         nikto_json="$host_out/reports/nikto.json"
-        rm -f "$nikto_json" 2>/dev/null || true
+        rm -f "$nikto_json" "$host_out/reports/nikto.json.json" 2>/dev/null || true
 
         run_step "nikto" "nikto" "$host_out" --soft-rcs "1" \
-          nikto -h "$BEST_URL" -Format json -output "$nikto_json" || true
+          nikto -h "$BEST_URL" -Format json -output "$nikto_base" || true
+
+        if [[ -s "$nikto_base.json" ]]; then
+          mv -f "$nikto_base.json" "$nikto_json"
+        elif [[ -s "$host_out/reports/nikto.json.json" ]]; then
+          mv -f "$host_out/reports/nikto.json.json" "$nikto_json"
+        fi
 
         if [[ ! -s "$nikto_json" ]]; then
           print_warn "nikto json empty"
@@ -832,7 +976,9 @@ for host in "${HOSTS[@]}"; do
       awk -v h="$host" '
         NF {
           u=$1
-          if (u ~ "^https?://" h "(:[0-9]+)?(/|$)" && $0 ~ /\[(200|204|301|302|307|308|401|403|405|500)\]/) {
+          if (u ~ "^https?://" h "(:[0-9]+)?(/|$)" &&
+              u !~ /(%5[Cc]|\\\\|[[:space:]])/ &&
+              $0 ~ /\[(200|204|206|301|302|307|308|401|403)\]/) {
             sub(/[?#].*$/,"",u)
             if (u ~ /\/[^\/]*$/) sub(/\/[^\/]*$/,"/",u)
             if (u ~ /^https?:\/\/[^\/]+\/.*/) print u
@@ -841,14 +987,24 @@ for host in "${HOSTS[@]}"; do
       ' "$KATANA_HTTPX" | sort -u | head -n "$KATANA_DIR_LIMIT" >"$KATANA_DIRS"
     fi
 
-    if [[ "$MODE" == "deep" ]]; then
+    if [[ "$MODE" != "passive" ]]; then
       if have ffuf && [[ -s "$KATANA_DIRS" ]]; then
+        if [[ "$MODE" == "fast" ]]; then
+          KATANA_FFUF_WL="$host_out/tmp/katana-fast-wordlist.txt"
+          write_fast_katana_wordlist "$KATANA_FFUF_WL"
+        else
+          KATANA_FFUF_WL="$WL_COMMON"
+        fi
+
         run_step "ffuf (katana dirs)" "ffuf_katana_dirs" "$host_out" \
           bash -c '
             set -euo pipefail
             : > "$1"
             while IFS= read -r base_dir; do
               [[ -n "$base_dir" ]] || continue
+              case "$base_dir" in
+                *"%5C"*|*"%5c"*|*\\*) continue ;;
+              esac
               tmp_out="${1}.tmp.$RANDOM.csv"
               ffuf -u "${base_dir%/}/FUZZ" -w "$2" \
                 -mc 200,204,301,302,307,308,401,403,405,500 \
@@ -858,28 +1014,52 @@ for host in "${HOSTS[@]}"; do
               fi
               rm -f "$tmp_out"
             done < "$4"
-          ' bash "$host_out/reports/ffuf_katana_dirs.csv" "$WL_COMMON" "$FFUF_RATE" "$KATANA_DIRS" || true
+          ' bash "$host_out/reports/ffuf_katana_dirs.csv" "$KATANA_FFUF_WL" "$FFUF_RATE" "$KATANA_DIRS" || true
       else
         print_skip "ffuf (katana dirs)"
       fi
     else
-      print_skip "ffuf (katana dirs) (deep mode only)"
+      print_skip "ffuf (katana dirs) (passive mode)"
     fi
 
     if [[ "$MODE" != "passive" ]]; then
       if have feroxbuster; then
         export STATE_FILENAME="$host_out/tmp/ferox-stdin-data.state"
-        run_step "feroxbuster" "feroxbuster" "$host_out" feroxbuster \
-          -u "$BEST_URL" \
-          -w "$DIR_WL" \
-          -x "$EXTENSIONS" \
-          -s 200,204,301,302,307,308,401,403,405,500 \
-          -k \
-          --random-agent \
-          --rate-limit "$FEROX_RL" \
-          --depth "$FEROX_DEPTH" \
-          --quiet \
-          -o "$host_out/reports/feroxbuster.txt" || true
+        if [[ "$MODE" == "fast" ]]; then
+          # Fast mode: root-only, depth-1 ferox pass with a smaller high-signal extension set.
+          # Keep -x, but avoid full EXTENSIONS and skip JS because JS is handled by katana + httpx validation.
+          FEROX_RAW="$host_out/reports/feroxbuster.raw.txt"
+          FEROX_CLEAN="$host_out/reports/feroxbuster.txt"
+          run_step "feroxbuster" "feroxbuster" "$host_out" feroxbuster \
+            -u "$BEST_URL" \
+            -w "$DIR_WL" \
+            -x "$FEROX_FAST_EXTENSIONS" \
+            -s 200,204,301,302,307,308,401,403,405 \
+            -k \
+            --random-agent \
+            --rate-limit "$FEROX_RL" \
+            --depth 1 \
+            --dont-extract-links \
+            --quiet \
+            -o "$FEROX_RAW" || true
+          filter_ferox_fast_output "$FEROX_RAW" "$FEROX_CLEAN"
+          if [[ -s "$FEROX_RAW" ]]; then
+            print_done "feroxbuster filtered: $(count_file "$FEROX_CLEAN")/$(count_file "$FEROX_RAW") lines kept"
+            log_line "DONE: feroxbuster filtered $(count_file "$FEROX_CLEAN")/$(count_file "$FEROX_RAW") lines kept"
+          fi
+        else
+          run_step "feroxbuster" "feroxbuster" "$host_out" feroxbuster \
+            -u "$BEST_URL" \
+            -w "$DIR_WL" \
+            -x "$EXTENSIONS" \
+            -s 200,204,301,302,307,308,401,403,405,500 \
+            -k \
+            --random-agent \
+            --rate-limit "$FEROX_RL" \
+            --depth "$FEROX_DEPTH" \
+            --quiet \
+            -o "$host_out/reports/feroxbuster.txt" || true
+        fi
         unset STATE_FILENAME
       else
         print_skip "feroxbuster (not installed)"
