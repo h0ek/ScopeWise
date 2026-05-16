@@ -2,17 +2,18 @@
 set -euo pipefail
 
 APP_NAME="scopewise"
-APP_VER="0.2.10"
+APP_VER="0.3.2"
 
 MODE="fast"
 TARGET_SINGLE=""
 TARGET_FILE=""
+CONFIG_FILE=""
+CHECK_ONLY=0
+MODE_CLI=""
 
 WEB_PORTS="80,443"
 WEB_PORTS_DEEP="80,443,8080,8443,8000,8888,3000,5000,9000"
 EXTENSIONS="js,json,xml,txt,log,bak,backup,old,zip,tar,gz,tgz,sql,db,sqlite,env,config,conf,ini,yml,yaml,map"
-# Fast ferox keeps extension probing, but uses a smaller high-signal list.
-# JS is intentionally excluded here because JS discovery is handled by katana + live httpx validation.
 FEROX_FAST_EXTENSIONS="json,txt,log,bak,backup,old,zip,sql,db,sqlite,env,config,conf,ini,yml,yaml,map"
 FFUF_EXTENSIONS=".js,.json,.xml,.txt,.log,.bak,.backup,.old,.zip,.tar.gz,.tgz,.sql,.db,.sqlite,.env,.config,.conf,.ini,.yml,.yaml,.map"
 
@@ -25,9 +26,9 @@ WL_FILE_MEDIUM="/usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt"
 banner() {
 cat <<'EOF_BANNER'
 
-▄█████  ▄▄▄▄  ▄▄▄  ▄▄▄▄  ▄▄▄▄▄ ██     ██ ▄▄  ▄▄▄▄ ▄▄▄▄▄ 
-▀▀▀▄▄▄ ██▀▀▀ ██▀██ ██▄█▀ ██▄▄  ██ ▄█▄ ██ ██ ███▄▄ ██▄▄  
-█████▀ ▀████ ▀███▀ ██    ██▄▄▄  ▀██▀██▀  ██ ▄▄██▀ ██▄▄▄ 
+\u2584\u2588\u2588\u2588\u2588\u2588  \u2584\u2584\u2584\u2584  \u2584\u2584\u2584  \u2584\u2584\u2584\u2584  \u2584\u2584\u2584\u2584\u2584 \u2588\u2588     \u2588\u2588 \u2584\u2584  \u2584\u2584\u2584\u2584 \u2584\u2584\u2584\u2584\u2584 
+\u2580\u2580\u2580\u2584\u2584\u2584 \u2588\u2588\u2580\u2580\u2580 \u2588\u2588\u2580\u2588\u2588 \u2588\u2588\u2584\u2588\u2580 \u2588\u2588\u2584\u2584  \u2588\u2588 \u2584\u2588\u2584 \u2588\u2588 \u2588\u2588 \u2588\u2588\u2588\u2584\u2584 \u2588\u2588\u2584\u2584  
+\u2588\u2588\u2588\u2588\u2588\u2580 \u2580\u2588\u2588\u2588\u2588 \u2580\u2588\u2588\u2588\u2580 \u2588\u2588    \u2588\u2588\u2584\u2584\u2584  \u2580\u2588\u2588\u2580\u2588\u2588\u2580  \u2588\u2588 \u2584\u2584\u2588\u2588\u2580 \u2588\u2588\u2584\u2584\u2584 
 
 EOF_BANNER
 printf '  %s v%s\n\n' "$APP_NAME" "$APP_VER"
@@ -46,18 +47,22 @@ RST=$'\033[0m'
 usage() {
   cat <<EOF_USAGE
 Usage:
-  $0 -u <domain|url> [--fast|--deep|--passive]
-  $0 -f <file_with_domains_or_urls> [--fast|--deep|--passive]
+  $0 -u <domain|url> [--fast|--deep|--passive] [--config scopewise.yml]
+  $0 -f <file_with_domains_or_urls> [--fast|--deep|--passive] [--config scopewise.yml]
+  $0 --check [--config scopewise.yml]
 
 Modes:
   --fast      Default. Balanced first-pass bounty recon.
   --deep      More thorough content discovery and crawling.
   --passive   Passive/light mode. Skips active content discovery and heavier scans.
+  --config    Optional config file. Defaults to ./scopewise.yml if present.
+  --check     Check dependencies and configured wordlists, then exit.
 
 Examples:
   $0 -u example.com
   $0 -u example.com --deep
   $0 -f urls.txt --passive
+  $0 --check
 EOF_USAGE
   exit 1
 }
@@ -106,10 +111,26 @@ spin_tick() {
   printf '\r%s[IN PROGRESS]%s %s %s' "$BLU" "$RST" "$label" "$c"
 }
 
+record_tool_status() {
+  local tool="${1:-unknown}"
+  local status="${2:-unknown}"
+  local details="${3:-}"
+  [[ -n "${TOOL_STATUS_FILE:-}" ]] || return 0
+  printf '%s\t%s\t%s\n' "$tool" "$status" "$details" >>"$TOOL_STATUS_FILE"
+}
+
 print_done() { printf '\r\033[K%s[DONE]%s  %s\n' "$GRN" "$RST" "$1"; }
 print_warn() { printf '\r\033[K%s[WARN]%s  %s\n' "$YEL" "$RST" "$1"; }
 print_fail() { printf '\r\033[K%s[FAIL]%s  %s\n' "$RED" "$RST" "$1"; }
-print_skip() { printf '\r\033[K%s[SKIP]%s  %s\n' "$YEL" "$RST" "$1"; }
+print_skip() {
+  printf '\r\033[K%s[SKIP]%s  %s\n' "$YEL" "$RST" "$1"
+  if [[ -n "${TOOL_STATUS_FILE:-}" ]]; then
+    case "$1" in
+      *"not installed"*) record_tool_status "$1" "missing" "$1" ;;
+      *) record_tool_status "$1" "skipped" "$1" ;;
+    esac
+  fi
+}
 
 format_duration() {
   local total="${1:-0}"
@@ -173,30 +194,114 @@ sitemap.xml
 EOF_FAST_KATANA
 }
 
+write_fast_ferox_wordlist() {
+  local output="$1"
+  cat >"$output" <<'EOF_FAST_FEROX'
+.env
+.git/HEAD
+.git/config
+.htaccess
+.htpasswd
+admin
+api
+app
+application
+appsettings
+backup
+backups
+cache
+config
+configuration
+conf
+db
+database
+debug
+dev
+dump
+env
+error
+errors
+files
+local
+log
+logs
+old
+openapi
+private
+prod
+production
+public
+robots
+secret
+secrets
+server
+settings
+sitemap
+staging
+static
+storage
+test
+upload
+uploads
+web
+EOF_FAST_FEROX
+}
+
 filter_ferox_fast_output() {
   local input="$1"
   local output="$2"
+  local filtered_403="$3"
+  local cloudflare_detected="${4:-0}"
 
-  [[ -s "$input" ]] || {
-    : >"$output"
-    return 0
-  }
+  : >"$output"
+  : >"$filtered_403"
 
-  # Remove obvious extension-probing noise caused by generated empty basenames, e.g.:
-  #   /cgi-bin/.json
-  #   /assets/.bak
-  # Keep useful hidden files such as .env and .git/config.
-  awk '
-    BEGIN {
-      noise_ext="(json|txt|log|bak|backup|old|zip|sql|db|sqlite|config|conf|ini|yml|yaml|map)"
+  [[ -s "$input" ]] || return 0
+
+  awk -v dropped="$filtered_403" -v cf="$cloudflare_detected" '
+    function url_path(u,   x) {
+      x=u
+      sub(/^https?:\/\/[^\/]+/, "", x)
+      if (x == "") x="/"
+      return x
     }
-    {
-      line=$0
-      # Empty basename extension probes: /.json, /.bak, /.config, etc.
-      if (line ~ "/\\." noise_ext "([[:space:]]|$|[?#])") next
-      # Very common package-manager backup/extension noise from generated probes.
-      if (line ~ "/\\.package-lock\\.json\\.(bak|backup|old|sql|db|sqlite|zip|map)([[:space:]]|$|[?#])") next
-      print line
+    function high_signal_403(path) {
+      if (path ~ /^\/\.env([\.\/]|$)/) return 1
+      if (path ~ /^\/\.git\/(HEAD|config|index|logs)([\.\/]|$)/) return 1
+      if (path ~ /^\/\.ht(access|passwd)([\.\/]|$)/) return 1
+      if (path ~ /(^|\/)(backup|backups|dump|database|db|config|configuration|conf|settings|secret|secrets|private|prod|production|staging|dev|debug|logs?|error|access|openapi|swagger|appsettings|web\.config)([\.\/]|$)/) return 1
+      if (path ~ /\.(env|bak|backup|old|zip|sql|db|sqlite|config|conf|ini|ya?ml|log|map)([?#]?|$)/) return 1
+      return 0
+    }
+    /^[0-9][0-9][0-9][[:space:]]/ {
+      status=$1
+      u=$NF
+      path=url_path(u)
+
+      # Empty basename extension probes: /.json, /.bak, /dir/.map, etc.
+      if (path ~ /\/\.(json|txt|log|bak|backup|old|zip|sql|db|sqlite|config|conf|ini|yml|yaml|map)([?#]?|$)/) {
+        print $0 >> dropped
+        next
+      }
+
+      # Common generated package-manager backup/extension noise.
+      if (path ~ /\/\.package-lock\.json\.(bak|backup|old|sql|db|sqlite|zip|map)([?#]?|$)/) {
+        print $0 >> dropped
+        next
+      }
+
+      if (status == "403" && cf == "1") {
+        print $0 >> dropped
+        next
+      }
+
+      if (status == "403" && !high_signal_403(path)) {
+        print $0 >> dropped
+        next
+      }
+
+      print $0
+      next
     }
   ' "$input" >"$output" || cp -f "$input" "$output"
 }
@@ -239,6 +344,7 @@ run_step() {
       wait "$pid" 2>/dev/null || true
       elapsed=$(( $(date +%s) - start_ts ))
       log_line "SKIP: ${label} ($(format_duration "$elapsed"))"
+      record_tool_status "$tool" "skipped" "$label"
       print_skip "${label} ($(format_duration "$elapsed"))"
       return 130
     fi
@@ -253,6 +359,7 @@ run_step() {
 
   if [[ "$rc" -eq 0 ]]; then
     log_line "DONE: ${label} (${pretty_elapsed})"
+    record_tool_status "$tool" "ok" "$label ${pretty_elapsed}"
     print_done "${label} (${pretty_elapsed})"
     return 0
   fi
@@ -275,10 +382,12 @@ run_step() {
 
   if [[ "$is_soft" -eq 1 ]]; then
     log_line "SOFT-RC: ${label} rc=${rc} (${pretty_elapsed})"
+    record_tool_status "$tool" "ok" "$label soft rc=${rc} ${pretty_elapsed}"
     print_done "${label} (soft rc=${rc}, ${pretty_elapsed})"
     return 0
   else
     log_line "RC: ${label} rc=${rc} (${pretty_elapsed})"
+    record_tool_status "$tool" "failed" "$label rc=${rc} ${pretty_elapsed}"
     print_warn "${label} (rc=${rc}, ${pretty_elapsed})"
     return "$rc"
   fi
@@ -311,6 +420,142 @@ choose_wordlist() {
   fi
 }
 
+load_config() {
+  local cfg="$1"
+  local section=""
+  local line=""
+  local key=""
+  local val=""
+  [[ -f "$cfg" ]] || return 0
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="$(trim "$line")"
+    [[ -z "$line" ]] && continue
+
+    if [[ "$line" == *":" && "$line" != *": "* ]]; then
+      section="${line%:}"
+      continue
+    fi
+
+    [[ "$line" == *":"* ]] || continue
+    key="$(trim "${line%%:*}")"
+    val="$(trim "${line#*:}")"
+    val="${val%\"}"
+    val="${val#\"}"
+    val="${val%\'}"
+    val="${val#\'}"
+
+    case "${section}.${key}" in
+      .mode) MODE="$val" ;;
+      ports.fast) CONFIG_PORTS_FAST="$val" ;;
+      ports.deep) CONFIG_PORTS_DEEP="$val" ;;
+      ports.passive) CONFIG_PORTS_PASSIVE="$val" ;;
+      rates.httpx) CONFIG_HTTPX_RL="$val" ;;
+      rates.nuclei) CONFIG_NUCLEI_RL="$val" ;;
+      rates.nuclei_concurrency) CONFIG_NUCLEI_C="$val" ;;
+      rates.ffuf) CONFIG_FFUF_RATE="$val" ;;
+      rates.ferox) CONFIG_FEROX_RL="$val" ;;
+      depths.katana_fast) CONFIG_KATANA_FAST="$val" ;;
+      depths.katana_deep) CONFIG_KATANA_DEEP="$val" ;;
+      depths.ferox_fast) CONFIG_FEROX_FAST_DEPTH="$val" ;;
+      depths.ferox_deep) CONFIG_FEROX_DEEP_DEPTH="$val" ;;
+      wordlists.common) WL_COMMON="$val" ;;
+      wordlists.dir_fast) CONFIG_DIR_WL_FAST="$val" ;;
+      wordlists.dir_deep) CONFIG_DIR_WL_DEEP="$val" ;;
+      wordlists.file_deep) CONFIG_FILE_WL_DEEP="$val" ;;
+      wordlists.dir_small) WL_DIR_SMALL="$val" ;;
+      wordlists.dir_medium) WL_DIR_MEDIUM="$val" ;;
+      wordlists.file_small) WL_FILE_SMALL="$val" ;;
+      wordlists.file_medium) WL_FILE_MEDIUM="$val" ;;
+      limits.katana_dirs_fast) CONFIG_KATANA_DIR_LIMIT_FAST="$val" ;;
+      limits.katana_dirs_deep) CONFIG_KATANA_DIR_LIMIT_DEEP="$val" ;;
+    esac
+  done <"$cfg"
+}
+
+apply_config_overrides() {
+  case "$MODE" in
+    fast)
+      WEB_PORTS="${CONFIG_PORTS_FAST:-$WEB_PORTS}"
+      DIR_WL="${CONFIG_DIR_WL_FAST:-$DIR_WL}"
+      KATANA_DEPTH="${CONFIG_KATANA_FAST:-$KATANA_DEPTH}"
+      FEROX_DEPTH="${CONFIG_FEROX_FAST_DEPTH:-$FEROX_DEPTH}"
+      KATANA_DIR_LIMIT="${CONFIG_KATANA_DIR_LIMIT_FAST:-$KATANA_DIR_LIMIT}"
+      ;;
+    deep)
+      WEB_PORTS="${CONFIG_PORTS_DEEP:-$WEB_PORTS}"
+      DIR_WL="${CONFIG_DIR_WL_DEEP:-$DIR_WL}"
+      FILE_WL="${CONFIG_FILE_WL_DEEP:-$FILE_WL}"
+      KATANA_DEPTH="${CONFIG_KATANA_DEEP:-$KATANA_DEPTH}"
+      FEROX_DEPTH="${CONFIG_FEROX_DEEP_DEPTH:-$FEROX_DEPTH}"
+      KATANA_DIR_LIMIT="${CONFIG_KATANA_DIR_LIMIT_DEEP:-$KATANA_DIR_LIMIT}"
+      ;;
+    passive)
+      WEB_PORTS="${CONFIG_PORTS_PASSIVE:-$WEB_PORTS}"
+      DIR_WL="${CONFIG_DIR_WL_FAST:-$DIR_WL}"
+      ;;
+  esac
+  HTTPX_RL="${CONFIG_HTTPX_RL:-$HTTPX_RL}"
+  NUCLEI_RL="${CONFIG_NUCLEI_RL:-$NUCLEI_RL}"
+  NUCLEI_C="${CONFIG_NUCLEI_C:-$NUCLEI_C}"
+  FFUF_RATE="${CONFIG_FFUF_RATE:-$FFUF_RATE}"
+  FEROX_RL="${CONFIG_FEROX_RL:-$FEROX_RL}"
+}
+
+check_file_status() {
+  local label="$1"
+  local path="$2"
+  if [[ -f "$path" ]]; then
+    printf '%-28s OK      %s\n' "$label" "$path"
+  else
+    printf '%-28s missing %s\n' "$label" "$path"
+  fi
+}
+
+run_dependency_check() {
+  local tools=(httpx katana nuclei nmap nikto sslscan ffuf feroxbuster gowitness subfinder bbot subzy waybackurls)
+  local t=""
+  printf 'ScopeWise dependency check\n\n'
+  printf 'Mode: %s\n' "$MODE"
+  [[ -n "${CONFIG_FILE:-}" ]] && printf 'Config: %s\n' "$CONFIG_FILE"
+  printf '\nTools:\n'
+  for t in "${tools[@]}"; do
+    if have "$t"; then
+      printf '  %-14s OK\n' "$t"
+    else
+      printf '  %-14s missing\n' "$t"
+    fi
+  done
+  printf '\nConfigured wordlists:\n'
+  check_file_status "common" "$WL_COMMON"
+  check_file_status "dir small" "$WL_DIR_SMALL"
+  check_file_status "dir medium" "$WL_DIR_MEDIUM"
+  check_file_status "file small" "$WL_FILE_SMALL"
+  check_file_status "file medium" "$WL_FILE_MEDIUM"
+  printf '\nEffective mode settings:\n'
+  printf '  web ports: %s\n' "$WEB_PORTS"
+  printf '  httpx rate: %s\n' "$HTTPX_RL"
+  printf '  nuclei rate: %s\n' "$NUCLEI_RL"
+  printf '  nuclei concurrency: %s\n' "$NUCLEI_C"
+  printf '  ffuf rate: %s\n' "$FFUF_RATE"
+  printf '  ferox rate: %s\n' "$FEROX_RL"
+  printf '  katana depth: %s\n' "$KATANA_DEPTH"
+  printf '  ferox depth: %s\n' "$FEROX_DEPTH"
+  printf '  dir wordlist: %s\n' "$DIR_WL"
+  printf '  file wordlist: %s\n' "$FILE_WL"
+}
+
+count_jsonl() {
+  local f="$1"
+  [[ -s "$f" ]] && awk 'NF{c++} END{print c+0}' "$f" || printf '0'
+}
+
+count_csv_data() {
+  local f="$1"
+  [[ -s "$f" ]] && awk 'NR>1 && NF{c++} END{print c+0}' "$f" || printf '0'
+}
+
 parse_args() {
   if [[ "$#" -eq 0 ]]; then
     usage
@@ -330,12 +575,23 @@ parse_args() {
         ;;
       --fast)
         MODE="fast"
+        MODE_CLI="fast"
         ;;
       --deep)
         MODE="deep"
+        MODE_CLI="deep"
         ;;
       --passive)
         MODE="passive"
+        MODE_CLI="passive"
+        ;;
+      --config)
+        shift
+        [[ "$#" -gt 0 ]] || usage
+        CONFIG_FILE="$1"
+        ;;
+      --check)
+        CHECK_ONLY=1
         ;;
       -h|--help)
         usage
@@ -420,6 +676,45 @@ clean_url_list() {
   else
     : >"$output"
   fi
+}
+
+detect_cloudflare() {
+  local input="$1"
+  [[ -s "$input" ]] || return 1
+  grep -Eiq 'cloudflare|cf-ray|cf-cache-status|cf-mitigated|__cf_bm|cf-chl|cdn-cgi' "$input"
+}
+
+split_ffuf_403_csv() {
+  local input="$1"
+  local main_output="$2"
+  local cf_output="$3"
+  : >"$main_output"
+  : >"$cf_output"
+  [[ -s "$input" ]] || return 0
+  awk -F',' -v main="$main_output" -v cf="$cf_output" '
+    NR == 1 {
+      header=$0
+      status_idx=0
+      for (i=1; i<=NF; i++) {
+        h=$i
+        gsub(/^"|"$/, "", h)
+        if (h == "status_code" || h == "status") status_idx=i
+      }
+      print header > main
+      print header > cf
+      next
+    }
+    $0 == header { next }
+    {
+      status=""
+      if (status_idx > 0) {
+        status=$status_idx
+        gsub(/^"|"$/, "", status)
+      }
+      if (status == "403") print $0 > cf
+      else print $0 > main
+    }
+  ' "$input" || cp -f "$input" "$main_output"
 }
 
 validate_live_url_file() {
@@ -564,69 +859,180 @@ count_file() {
   fi
 }
 
-write_host_readme() {
+write_host_summary() {
   local host_out="$1"
   local host="$2"
+  local host_elapsed="${3:-0}"
+  local summary="$host_out/reports/summary.md"
+  local cf="no"
+  local edge="unknown"
+  local cf_note=""
+  local status_file="$host_out/context/tool_status.tsv"
+  local ok_count=0
+  local missing_count=0
+  local failed_count=0
+  local skipped_count=0
+  local empty_count=0
 
-  cat >"$host_out/README-FIRST.txt" <<EOF_README
-ScopeWise host output: $host
-Mode: $MODE
+  mkdir -p "$host_out/reports"
+  local BT=$'\x60'
 
-Review first:
-  reports/nuclei_exposures.jsonl
-  reports/nuclei_takeover.jsonl
-  reports/nuclei.jsonl
-  reports/nikto.json
-  reports/nmap_web.xml
-  reports/sslscan.xml
-  context/interesting_files_live.txt
-  context/api_candidates_live.txt
-  context/js_files.txt
-  context/interesting_params.txt
-  context/interesting_files_raw.txt
-  context/api_candidates_raw.txt
-  context/js_files_raw.txt
-  context/js_httpx.txt
-  context/source_maps.txt
-  reports/feroxbuster.txt
-  reports/ffuf_files.csv
-  reports/ffuf_dirs.csv
-  reports/subzy.json
-  reports/gowitness/
+  [[ -f "$host_out/context/cloudflare_detected.txt" ]] && cf="$(cat "$host_out/context/cloudflare_detected.txt" 2>/dev/null | head -n 1)"
+  [[ -f "$host_out/context/edge_provider.txt" ]] && edge="$(cat "$host_out/context/edge_provider.txt" 2>/dev/null | head -n 1)"
 
-Gowitness review:
-  cd "$host_out"
-  gowitness report server \
-    --db-uri "sqlite://reports/gowitness/gowitness.sqlite3" \
-    --screenshot-path "reports/gowitness/screenshots"
+  if [[ "$cf" == "yes" ]]; then
+    cf_note="Cloudflare/WAF was detected. Treat 403 results as low-confidence edge/WAF responses unless the body confirms a real resource. nmap and sslscan likely describe the edge, not the origin."
+  else
+    cf_note="No Cloudflare signal detected by ScopeWise."
+  fi
+
+  if [[ -s "$status_file" ]]; then
+    ok_count="$(awk -F'\t' '$2=="ok"{c++} END{print c+0}' "$status_file")"
+    missing_count="$(awk -F'\t' '$2=="missing"{c++} END{print c+0}' "$status_file")"
+    failed_count="$(awk -F'\t' '$2=="failed"{c++} END{print c+0}' "$status_file")"
+    skipped_count="$(awk -F'\t' '$2=="skipped"{c++} END{print c+0}' "$status_file")"
+    empty_count="$(awk -F'\t' '$2=="empty"{c++} END{print c+0}' "$status_file")"
+  fi
+
+  cat >"$summary" <<EOF_SUMMARY
+# ScopeWise Summary: $host
+
+## Overview
+
+| Field | Value |
+|---|---:|
+| Host | $host |
+| Mode | $MODE |
+| Cloudflare | $cf |
+| Edge provider | $edge |
+| Host time | $(format_duration "$host_elapsed") |
+| Live URLs | $(count_file "$host_out/context/all_urls_live.txt") |
+| Raw URLs | $(count_file "$host_out/context/all_urls_raw.txt") |
+| Interesting files live | $(count_file "$host_out/context/interesting_files_live.txt") |
+| Interesting files raw | $(count_file "$host_out/context/interesting_files_raw.txt") |
+| API candidates live | $(count_file "$host_out/context/api_candidates_live.txt") |
+| API candidates raw | $(count_file "$host_out/context/api_candidates_raw.txt") |
+| Live JS files | $(count_file "$host_out/context/js_files.txt") |
+| JS candidates raw | $(count_file "$host_out/context/js_files_raw.txt") |
+| Nuclei findings | $(count_jsonl "$host_out/reports/nuclei.jsonl") |
+| Nuclei exposure findings | $(count_jsonl "$host_out/reports/nuclei_exposures.jsonl") |
+| Nuclei takeover findings | $(count_jsonl "$host_out/reports/nuclei_takeover.jsonl") |
+| Nuclei JS findings | $(count_jsonl "$host_out/reports/nuclei_js_exposure.jsonl") |
+| FFUF dirs | $(count_csv_data "$host_out/reports/ffuf_dirs.csv") |
+| FFUF dirs 403 | $(count_csv_data "$host_out/reports/ffuf_dirs_403.csv") |
+| FFUF files | $(count_csv_data "$host_out/reports/ffuf_files.csv") |
+| FFUF files 403 | $(count_csv_data "$host_out/reports/ffuf_files_403.csv") |
+| FFUF katana dirs | $(count_csv_data "$host_out/reports/ffuf_katana_dirs.csv") |
+| FFUF katana dirs 403 | $(count_csv_data "$host_out/reports/ffuf_katana_dirs_403.csv") |
+| Ferox filtered | $(count_file "$host_out/reports/feroxbuster.txt") |
+| Ferox raw | $(count_file "$host_out/reports/feroxbuster.raw.txt") |
+| Ferox 403 filtered | $(count_file "$host_out/reports/feroxbuster_403_filtered.txt") |
+
+## Cloudflare / WAF Note
+
+$cf_note
+
+## Review First
+
+- ${BT}reports/nuclei_exposures.jsonl${BT} \u2013 exposed files, backups, configs, logs, misconfigs
+- ${BT}reports/nuclei_takeover.jsonl${BT} \u2013 possible subdomain takeover findings
+- ${BT}reports/nuclei.jsonl${BT} \u2013 general nuclei findings
+- ${BT}reports/nikto.json${BT} \u2013 Nikto output, if available
+- ${BT}reports/nmap_web.xml${BT} \u2013 nmap web-port scan
+- ${BT}reports/sslscan.xml${BT} \u2013 TLS scan
+- ${BT}context/interesting_files_live.txt${BT} \u2013 live interesting files
+- ${BT}context/api_candidates_live.txt${BT} \u2013 live API candidates
+- ${BT}context/js_files.txt${BT} \u2013 live JavaScript files
+- ${BT}context/interesting_params.txt${BT} \u2013 raw parameter review queue
+- ${BT}context/source_maps.txt${BT} \u2013 source map candidates
+- ${BT}reports/feroxbuster.txt${BT} \u2013 filtered ferox results
+- ${BT}reports/ffuf_files.csv${BT} \u2013 file discovery results
+- ${BT}reports/ffuf_dirs.csv${BT} \u2013 directory discovery results
+- ${BT}reports/subzy.json${BT} \u2013 takeover checks
+- ${BT}reports/gowitness/${BT} \u2013 screenshots and gowitness database/exports
+
+## Raw / Historical Context
+
+- ${BT}context/all_urls_raw.txt${BT}
+- ${BT}context/all_urls.txt${BT}
+- ${BT}context/interesting_files_raw.txt${BT}
+- ${BT}context/api_candidates_raw.txt${BT}
+- ${BT}context/js_files_raw.txt${BT}
+- ${BT}context/waybackurls.txt${BT}
+- ${BT}reports/feroxbuster.raw.txt${BT}
+
+## Low-Confidence 403 Queues
+
+- ${BT}reports/ffuf_dirs_403.csv${BT}
+- ${BT}reports/ffuf_files_403.csv${BT}
+- ${BT}reports/ffuf_katana_dirs_403.csv${BT}
+- ${BT}reports/feroxbuster_403_filtered.txt${BT}
+
+## Manual Queues
+
+- ${BT}context/redirect_candidates.txt${BT}
+- ${BT}context/lfi_candidates.txt${BT}
+- ${BT}context/sqli_candidates.txt${BT}
+- ${BT}context/interesting_params.txt${BT}
+
+## Gowitness Review
+
+From this host folder:
+
+${BT}${BT}${BT}bash
+gowitness report server \\\
+  --db-uri "sqlite://reports/gowitness/gowitness.sqlite3" \\\
+  --screenshot-path "reports/gowitness/screenshots"
+${BT}${BT}${BT}
 
 Then open:
-  http://127.0.0.1:7171
 
-Manual queues:
-  context/redirect_candidates.txt
-  context/lfi_candidates.txt
-  context/sqli_candidates.txt
+${BT}${BT}${BT}text
+http://127.0.0.1:7171
+${BT}${BT}${BT}
 
-Context:
-  context/all_urls_raw.txt
-  context/all_urls_live.txt
-  context/all_urls.txt
-  context/live_urls.txt
-  context/katana_urls.txt
-  context/waybackurls.txt
-  context/subdomains.txt
+## Tool Status
 
-Troubleshooting:
-  debug/*.stdout
-  debug/*.stderr
-  tmp/
-EOF_README
+| Status | Count |
+|---|---:|
+| OK | $ok_count |
+| Missing | $missing_count |
+| Failed | $failed_count |
+| Empty output | $empty_count |
+| Skipped | $skipped_count |
+
+Full status file: ${BT}context/tool_status.tsv${BT}
+
+## Troubleshooting
+
+- ${BT}debug/*.stdout${BT}
+- ${BT}debug/*.stderr${BT}
+- ${BT}tmp/${BT}
+EOF_SUMMARY
 }
 
+
 parse_args "$@"
-banner
+if [[ -z "$CONFIG_FILE" && -f "scopewise.yml" ]]; then
+  CONFIG_FILE="scopewise.yml"
+fi
+if [[ -n "$CONFIG_FILE" ]]; then
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    print_fail "Config file not found: $CONFIG_FILE"
+    exit 1
+  fi
+  load_config "$CONFIG_FILE"
+fi
+if [[ -n "$MODE_CLI" ]]; then
+  MODE="$MODE_CLI"
+fi
 configure_mode
+apply_config_overrides
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  run_dependency_check
+  exit 0
+fi
+banner
 RUN_START_TS="$(date +%s)"
 
 if [[ -z "${TARGET_SINGLE}" && -z "${TARGET_FILE}" ]]; then
@@ -703,8 +1109,11 @@ for host in "${HOSTS[@]}"; do
     printf '\n%s[%s/%s] %s%s\n' "$BLU" "$idx" "$TOTAL_HOSTS" "$host" "$RST"
     log_line "HOST: ${host} (${idx}/${TOTAL_HOSTS})"
 
+    host_start_ts="$(date +%s)"
     host_out="$OUT_DIR/$host"
     mkdir -p "$host_out/reports" "$host_out/context" "$host_out/debug" "$host_out/tmp"
+    TOOL_STATUS_FILE="$host_out/context/tool_status.tsv"
+    : >"$TOOL_STATUS_FILE"
     if [[ "$FILE_WL" == "__FAST_CRITICAL_FILES__" ]]; then
       FILE_WL="$host_out/tmp/critical-files.txt"
       write_fast_file_wordlist "$FILE_WL"
@@ -746,6 +1155,20 @@ for host in "${HOSTS[@]}"; do
     printf '%s\n' "$host" >"$host_out/context/target_host.txt"
     BEST_URL="$(pick_best_url "$HOST_URLS" "$host")"
     printf '%s\n' "$BEST_URL" >"$host_out/context/target_url.txt"
+
+    CLOUDFLARE_DETECTED=0
+    EDGE_PROVIDER_FILE="$host_out/context/edge_provider.txt"
+    CLOUDFLARE_FILE="$host_out/context/cloudflare_detected.txt"
+    if detect_cloudflare "$HOST_HTTPX_RAW"; then
+      CLOUDFLARE_DETECTED=1
+      printf 'yes\n' >"$CLOUDFLARE_FILE"
+      printf 'cloudflare\n' >"$EDGE_PROVIDER_FILE"
+      print_warn "Cloudflare detected; 403, nmap, sslscan and nikto results may describe edge/WAF behavior"
+      log_line "WARN: Cloudflare detected for ${host}"
+    else
+      printf 'no\n' >"$CLOUDFLARE_FILE"
+      printf 'unknown\n' >"$EDGE_PROVIDER_FILE"
+    fi
 
     KATANA_RAW="$host_out/context/katana.txt"
     KATANA_URLS="$host_out/context/katana_urls.txt"
@@ -807,7 +1230,6 @@ for host in "${HOSTS[@]}"; do
       | sed 's/\r$//' \
       | sort -u >"$ALL_URLS_RAW"
 
-    # Backward-compatible alias: all_urls.txt remains the raw/full URL set.
     cp -f "$ALL_URLS_RAW" "$ALL_URLS"
 
     clean_url_list "$ALL_URLS_RAW" "$ALL_URLS_CLEAN"
@@ -901,14 +1323,15 @@ for host in "${HOSTS[@]}"; do
         run_step "nikto" "nikto" "$host_out" --soft-rcs "1" \
           nikto -h "$BEST_URL" -Format json -output "$nikto_base" || true
 
-        if [[ -s "$nikto_base.json" ]]; then
+        if [[ -s "$nikto_base.json" && "$nikto_base.json" != "$nikto_json" ]]; then
           mv -f "$nikto_base.json" "$nikto_json"
-        elif [[ -s "$host_out/reports/nikto.json.json" ]]; then
+        elif [[ -s "$host_out/reports/nikto.json.json" && "$host_out/reports/nikto.json.json" != "$nikto_json" ]]; then
           mv -f "$host_out/reports/nikto.json.json" "$nikto_json"
         fi
 
         if [[ ! -s "$nikto_json" ]]; then
           print_warn "nikto json empty"
+          record_tool_status "nikto" "empty" "nikto json empty"
           log_line "WARN: nikto json empty"
         fi
       else
@@ -941,6 +1364,11 @@ for host in "${HOSTS[@]}"; do
           -rate "$FFUF_RATE" \
           -of csv \
           -o "$host_out/reports/ffuf_dirs.csv" || true
+        if [[ "${CLOUDFLARE_DETECTED:-0}" -eq 1 && -s "$host_out/reports/ffuf_dirs.csv" ]]; then
+          split_ffuf_403_csv "$host_out/reports/ffuf_dirs.csv" "$host_out/reports/ffuf_dirs.no403.csv" "$host_out/reports/ffuf_dirs_403.csv"
+          mv -f "$host_out/reports/ffuf_dirs.no403.csv" "$host_out/reports/ffuf_dirs.csv"
+          print_done "ffuf dirs 403 split: $(count_file "$host_out/reports/ffuf_dirs_403.csv") lines"
+        fi
 
         if [[ "$MODE" == "fast" || "$MODE" == "passive" ]]; then
           run_step "ffuf files" "ffuf_files" "$host_out" ffuf \
@@ -961,6 +1389,11 @@ for host in "${HOSTS[@]}"; do
             -rate "$FFUF_RATE" \
             -of csv \
             -o "$host_out/reports/ffuf_files.csv" || true
+        fi
+        if [[ "${CLOUDFLARE_DETECTED:-0}" -eq 1 && -s "$host_out/reports/ffuf_files.csv" ]]; then
+          split_ffuf_403_csv "$host_out/reports/ffuf_files.csv" "$host_out/reports/ffuf_files.no403.csv" "$host_out/reports/ffuf_files_403.csv"
+          mv -f "$host_out/reports/ffuf_files.no403.csv" "$host_out/reports/ffuf_files.csv"
+          print_done "ffuf files 403 split: $(count_file "$host_out/reports/ffuf_files_403.csv") lines"
         fi
       else
         print_skip "ffuf (not installed)"
@@ -999,22 +1432,32 @@ for host in "${HOSTS[@]}"; do
         run_step "ffuf (katana dirs)" "ffuf_katana_dirs" "$host_out" \
           bash -c '
             set -euo pipefail
-            : > "$1"
+            out="$1"
+            : > "$out"
             while IFS= read -r base_dir; do
               [[ -n "$base_dir" ]] || continue
               case "$base_dir" in
                 *"%5C"*|*"%5c"*|*\\*) continue ;;
               esac
-              tmp_out="${1}.tmp.$RANDOM.csv"
+              tmp_out="${out}.tmp.$RANDOM.csv"
               ffuf -u "${base_dir%/}/FUZZ" -w "$2" \
                 -mc 200,204,301,302,307,308,401,403,405,500 \
                 -ac -rate "$3" -of csv -o "$tmp_out" >/dev/null 2>&1 || true
               if [[ -s "$tmp_out" ]]; then
-                cat "$tmp_out" >> "$1"
+                if [[ ! -s "$out" ]]; then
+                  cat "$tmp_out" >> "$out"
+                else
+                  tail -n +2 "$tmp_out" >> "$out"
+                fi
               fi
               rm -f "$tmp_out"
             done < "$4"
           ' bash "$host_out/reports/ffuf_katana_dirs.csv" "$KATANA_FFUF_WL" "$FFUF_RATE" "$KATANA_DIRS" || true
+        if [[ "${CLOUDFLARE_DETECTED:-0}" -eq 1 && -s "$host_out/reports/ffuf_katana_dirs.csv" ]]; then
+          split_ffuf_403_csv "$host_out/reports/ffuf_katana_dirs.csv" "$host_out/reports/ffuf_katana_dirs.no403.csv" "$host_out/reports/ffuf_katana_dirs_403.csv"
+          mv -f "$host_out/reports/ffuf_katana_dirs.no403.csv" "$host_out/reports/ffuf_katana_dirs.csv"
+          print_done "ffuf katana dirs 403 split: $(count_file "$host_out/reports/ffuf_katana_dirs_403.csv") lines"
+        fi
       else
         print_skip "ffuf (katana dirs)"
       fi
@@ -1026,13 +1469,14 @@ for host in "${HOSTS[@]}"; do
       if have feroxbuster; then
         export STATE_FILENAME="$host_out/tmp/ferox-stdin-data.state"
         if [[ "$MODE" == "fast" ]]; then
-          # Fast mode: root-only, depth-1 ferox pass with a smaller high-signal extension set.
-          # Keep -x, but avoid full EXTENSIONS and skip JS because JS is handled by katana + httpx validation.
+          FEROX_FAST_WL="$host_out/tmp/ferox-fast-words.txt"
           FEROX_RAW="$host_out/reports/feroxbuster.raw.txt"
           FEROX_CLEAN="$host_out/reports/feroxbuster.txt"
+          FEROX_403_FILTERED="$host_out/reports/feroxbuster_403_filtered.txt"
+          write_fast_ferox_wordlist "$FEROX_FAST_WL"
           run_step "feroxbuster" "feroxbuster" "$host_out" feroxbuster \
             -u "$BEST_URL" \
-            -w "$DIR_WL" \
+            -w "$FEROX_FAST_WL" \
             -x "$FEROX_FAST_EXTENSIONS" \
             -s 200,204,301,302,307,308,401,403,405 \
             -k \
@@ -1042,10 +1486,10 @@ for host in "${HOSTS[@]}"; do
             --dont-extract-links \
             --quiet \
             -o "$FEROX_RAW" || true
-          filter_ferox_fast_output "$FEROX_RAW" "$FEROX_CLEAN"
+          filter_ferox_fast_output "$FEROX_RAW" "$FEROX_CLEAN" "$FEROX_403_FILTERED" "${CLOUDFLARE_DETECTED:-0}"
           if [[ -s "$FEROX_RAW" ]]; then
             print_done "feroxbuster filtered: $(count_file "$FEROX_CLEAN")/$(count_file "$FEROX_RAW") lines kept"
-            log_line "DONE: feroxbuster filtered $(count_file "$FEROX_CLEAN")/$(count_file "$FEROX_RAW") lines kept"
+            log_line "DONE: feroxbuster filtered $(count_file "$FEROX_CLEAN")/$(count_file "$FEROX_RAW") lines kept; filtered_403=$(count_file "$FEROX_403_FILTERED")"
           fi
         else
           run_step "feroxbuster" "feroxbuster" "$host_out" feroxbuster \
@@ -1146,8 +1590,11 @@ for host in "${HOSTS[@]}"; do
       print_skip "subzy (not installed)"
     fi
 
-    write_host_readme "$host_out" "$host"
-    print_done "Host report: $host_out"
+    host_elapsed=$(( $(date +%s) - host_start_ts ))
+    write_host_summary "$host_out" "$host" "$host_elapsed"
+    printf '%s	%s	%s	%s	%s	%s	%s	%s	%s
+' "$host" "${CLOUDFLARE_DETECTED:-0}" "$(count_file "$host_out/context/all_urls_live.txt")" "$(count_file "$host_out/context/interesting_files_live.txt")" "$(count_file "$host_out/context/api_candidates_live.txt")" "$(count_file "$host_out/context/js_files.txt")" "$(count_jsonl "$host_out/reports/nuclei.jsonl")" "$(count_csv_data "$host_out/reports/ffuf_dirs.csv")" "$(count_file "$host_out/reports/feroxbuster.txt")" >>"$RUN_DIR/host_summary.tsv"
+    print_done "Host summary: $host_out/reports/summary.md"
   ) || {
     print_warn "Host failed: $host (see log)"
     log_line "HOST FAILED: $host"
