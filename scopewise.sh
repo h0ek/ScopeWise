@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_NAME="scopewise"
-APP_VER="0.3.2"
+APP_VER="0.3.3"
 
 MODE="fast"
 TARGET_SINGLE=""
@@ -10,6 +10,7 @@ TARGET_FILE=""
 CONFIG_FILE=""
 CHECK_ONLY=0
 MODE_CLI=""
+STEP_MAX_SECONDS="5400"
 
 WEB_PORTS="80,443"
 WEB_PORTS_DEEP="80,443,8080,8443,8000,8888,3000,5000,9000"
@@ -26,9 +27,9 @@ WL_FILE_MEDIUM="/usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt"
 banner() {
 cat <<'EOF_BANNER'
 
-\u2584\u2588\u2588\u2588\u2588\u2588  \u2584\u2584\u2584\u2584  \u2584\u2584\u2584  \u2584\u2584\u2584\u2584  \u2584\u2584\u2584\u2584\u2584 \u2588\u2588     \u2588\u2588 \u2584\u2584  \u2584\u2584\u2584\u2584 \u2584\u2584\u2584\u2584\u2584 
-\u2580\u2580\u2580\u2584\u2584\u2584 \u2588\u2588\u2580\u2580\u2580 \u2588\u2588\u2580\u2588\u2588 \u2588\u2588\u2584\u2588\u2580 \u2588\u2588\u2584\u2584  \u2588\u2588 \u2584\u2588\u2584 \u2588\u2588 \u2588\u2588 \u2588\u2588\u2588\u2584\u2584 \u2588\u2588\u2584\u2584  
-\u2588\u2588\u2588\u2588\u2588\u2580 \u2580\u2588\u2588\u2588\u2588 \u2580\u2588\u2588\u2588\u2580 \u2588\u2588    \u2588\u2588\u2584\u2584\u2584  \u2580\u2588\u2588\u2580\u2588\u2588\u2580  \u2588\u2588 \u2584\u2584\u2588\u2588\u2580 \u2588\u2588\u2584\u2584\u2584 
+▄█████  ▄▄▄▄  ▄▄▄  ▄▄▄▄  ▄▄▄▄▄ ██     ██ ▄▄  ▄▄▄▄ ▄▄▄▄▄ 
+▀▀▀▄▄▄ ██▀▀▀ ██▀██ ██▄█▀ ██▄▄  ██ ▄█▄ ██ ██ ███▄▄ ██▄▄  
+█████▀ ▀████ ▀███▀ ██    ██▄▄▄  ▀██▀██▀  ██ ▄▄██▀ ██▄▄▄ 
 
 EOF_BANNER
 printf '  %s v%s\n\n' "$APP_NAME" "$APP_VER"
@@ -124,7 +125,7 @@ print_warn() { printf '\r\033[K%s[WARN]%s  %s\n' "$YEL" "$RST" "$1"; }
 print_fail() { printf '\r\033[K%s[FAIL]%s  %s\n' "$RED" "$RST" "$1"; }
 print_skip() {
   printf '\r\033[K%s[SKIP]%s  %s\n' "$YEL" "$RST" "$1"
-  if [[ -n "${TOOL_STATUS_FILE:-}" ]]; then
+  if [[ -n "${TOOL_STATUS_FILE:-}" && "${PRINT_SKIP_RECORD_STATUS:-1}" == "1" ]]; then
     case "$1" in
       *"not installed"*) record_tool_status "$1" "missing" "$1" ;;
       *) record_tool_status "$1" "skipped" "$1" ;;
@@ -316,10 +317,22 @@ run_step() {
   shift 3
 
   local soft_rcs="${SOFT_RCS:-}"
-  if [[ "${1:-}" == "--soft-rcs" ]]; then
-    soft_rcs="$2"
-    shift 2
-  fi
+  local max_seconds="0"
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --soft-rcs)
+        soft_rcs="$2"
+        shift 2
+        ;;
+      --max-seconds)
+        max_seconds="$2"
+        shift 2
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
 
   mkdir -p "${host_out}/debug"
   local stdout_file="${host_out}/debug/${tool}.stdout"
@@ -327,26 +340,60 @@ run_step() {
   local start_ts
   local elapsed
   local pretty_elapsed
+  local use_setsid=0
   start_ts="$(date +%s)"
 
   INT_SKIP=0
   log_line "START: ${label}"
   log_line "CMD: $*"
 
-  ( "$@" >"$stdout_file" 2>"$stderr_file" ) &
+  if have setsid; then
+    ( exec setsid "$@" >"$stdout_file" 2>"$stderr_file" ) &
+    use_setsid=1
+  else
+    ( "$@" >"$stdout_file" 2>"$stderr_file" ) &
+  fi
   local pid=$!
 
   while kill -0 "$pid" 2>/dev/null; do
+    elapsed=$(( $(date +%s) - start_ts ))
     if [[ "$INT_SKIP" -eq 1 ]]; then
-      kill -INT "$pid" 2>/dev/null || true
+      if [[ "$use_setsid" -eq 1 ]]; then
+        kill -INT -- "-$pid" 2>/dev/null || kill -INT "$pid" 2>/dev/null || true
+      else
+        kill -INT "$pid" 2>/dev/null || true
+      fi
       sleep 0.2
-      kill -KILL "$pid" 2>/dev/null || true
+      if [[ "$use_setsid" -eq 1 ]]; then
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      else
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
       wait "$pid" 2>/dev/null || true
       elapsed=$(( $(date +%s) - start_ts ))
-      log_line "SKIP: ${label} ($(format_duration "$elapsed"))"
-      record_tool_status "$tool" "skipped" "$label"
-      print_skip "${label} ($(format_duration "$elapsed"))"
+      log_line "INTERRUPTED: ${label} ($(format_duration "$elapsed"))"
+      record_tool_status "$tool" "interrupted" "$label $(format_duration "$elapsed")"
+      PRINT_SKIP_RECORD_STATUS=0 print_skip "${label} (interrupted, $(format_duration "$elapsed"))"
       return 130
+    fi
+    if [[ "$max_seconds" =~ ^[0-9]+$ && "$max_seconds" -gt 0 && "$elapsed" -ge "$max_seconds" ]]; then
+      if [[ "$use_setsid" -eq 1 ]]; then
+        kill -INT -- "-$pid" 2>/dev/null || kill -INT "$pid" 2>/dev/null || true
+      else
+        kill -INT "$pid" 2>/dev/null || true
+      fi
+      sleep 0.5
+      if [[ "$use_setsid" -eq 1 ]]; then
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+      else
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+      wait "$pid" 2>/dev/null || true
+      elapsed=$(( $(date +%s) - start_ts ))
+      log_line "TIMEOUT: ${label} after $(format_duration "$elapsed")"
+      record_tool_status "$tool" "timeout" "$label timeout $(format_duration "$elapsed")"
+      print_warn "${label} (timeout, $(format_duration "$elapsed"))"
+      return 124
     fi
     spin_tick "$label"
     sleep 0.12
@@ -391,6 +438,14 @@ run_step() {
     print_warn "${label} (rc=${rc}, ${pretty_elapsed})"
     return "$rc"
   fi
+}
+
+run_step_limited() {
+  local label="$1"
+  local tool="$2"
+  local host_out="$3"
+  shift 3
+  run_step "$label" "$tool" "$host_out" --max-seconds "$STEP_MAX_SECONDS" "$@"
 }
 
 pick_best_url() {
@@ -470,6 +525,7 @@ load_config() {
       wordlists.file_medium) WL_FILE_MEDIUM="$val" ;;
       limits.katana_dirs_fast) CONFIG_KATANA_DIR_LIMIT_FAST="$val" ;;
       limits.katana_dirs_deep) CONFIG_KATANA_DIR_LIMIT_DEEP="$val" ;;
+      limits.step_timeout_seconds) STEP_MAX_SECONDS="$val" ;;
     esac
   done <"$cfg"
 }
@@ -544,6 +600,7 @@ run_dependency_check() {
   printf '  ferox depth: %s\n' "$FEROX_DEPTH"
   printf '  dir wordlist: %s\n' "$DIR_WL"
   printf '  file wordlist: %s\n' "$FILE_WL"
+  printf '  step timeout seconds: %s\n' "$STEP_MAX_SECONDS"
 }
 
 count_jsonl() {
@@ -873,6 +930,8 @@ write_host_summary() {
   local failed_count=0
   local skipped_count=0
   local empty_count=0
+  local timeout_count=0
+  local interrupted_count=0
 
   mkdir -p "$host_out/reports"
   local BT=$'\x60'
@@ -931,6 +990,10 @@ write_host_summary() {
 ## Cloudflare / WAF Note
 
 $cf_note
+
+## Interruption / Timeout Note
+
+Ctrl+C skips the currently running step, preserves partial output when the underlying tool has already written it, and continues with the next step. Long non-core scan steps have a configurable timeout. Default step timeout: $STEP_MAX_SECONDS seconds.
 
 ## Review First
 
@@ -999,6 +1062,8 @@ ${BT}${BT}${BT}
 | Missing | $missing_count |
 | Failed | $failed_count |
 | Empty output | $empty_count |
+| Timeout | $timeout_count |
+| Interrupted | $interrupted_count |
 | Skipped | $skipped_count |
 
 Full status file: ${BT}context/tool_status.tsv${BT}
@@ -1251,7 +1316,7 @@ for host in "${HOSTS[@]}"; do
     print_done "live js files: $(count_file "$host_out/context/js_files.txt")"
 
     if have nuclei; then
-      run_step "nuclei general" "nuclei_general" "$host_out" nuclei \
+      run_step_limited "nuclei general" "nuclei_general" "$host_out" nuclei \
         -l "$HOST_URLS" \
         -severity medium,high,critical \
         -stats \
@@ -1262,7 +1327,7 @@ for host in "${HOSTS[@]}"; do
         -timeout 10 \
         -retries 2 || true
 
-      run_step "nuclei exposures" "nuclei_exposures" "$host_out" nuclei \
+      run_step_limited "nuclei exposures" "nuclei_exposures" "$host_out" nuclei \
         -l "$HOST_URLS" \
         -tags exposure,misconfig,files,logs,backup,config \
         -jsonl \
@@ -1272,7 +1337,7 @@ for host in "${HOSTS[@]}"; do
         -timeout 10 \
         -retries 2 || true
 
-      run_step "nuclei takeover" "nuclei_takeover" "$host_out" nuclei \
+      run_step_limited "nuclei takeover" "nuclei_takeover" "$host_out" nuclei \
         -l "$HOST_URLS" \
         -tags takeover \
         -jsonl \
@@ -1283,7 +1348,7 @@ for host in "${HOSTS[@]}"; do
         -retries 2 || true
 
       if [[ -s "$host_out/context/js_files.txt" ]]; then
-        run_step "nuclei js exposure" "nuclei_js_exposure" "$host_out" nuclei \
+        run_step_limited "nuclei js exposure" "nuclei_js_exposure" "$host_out" nuclei \
           -l "$host_out/context/js_files.txt" \
           -tags exposure,token,secret \
           -jsonl \
@@ -1299,7 +1364,7 @@ for host in "${HOSTS[@]}"; do
 
     if [[ "$MODE" != "passive" ]]; then
       if have nmap; then
-        run_step "nmap" "nmap" "$host_out" nmap \
+        run_step_limited "nmap" "nmap" "$host_out" nmap \
           -sS \
           -sV \
           -sC \
@@ -1320,7 +1385,7 @@ for host in "${HOSTS[@]}"; do
         nikto_json="$host_out/reports/nikto.json"
         rm -f "$nikto_json" "$host_out/reports/nikto.json.json" 2>/dev/null || true
 
-        run_step "nikto" "nikto" "$host_out" --soft-rcs "1" \
+        run_step_limited "nikto" "nikto" "$host_out" --soft-rcs "1" \
           nikto -h "$BEST_URL" -Format json -output "$nikto_base" || true
 
         if [[ -s "$nikto_base.json" && "$nikto_base.json" != "$nikto_json" ]]; then
@@ -1344,7 +1409,7 @@ for host in "${HOSTS[@]}"; do
     if have sslscan; then
       if [[ "$BEST_URL" == https://* ]]; then
         ssl_h="$(url_host "$BEST_URL")"
-        run_step "sslscan" "sslscan" "$host_out" sslscan \
+        run_step_limited "sslscan" "sslscan" "$host_out" sslscan \
           --xml="$host_out/reports/sslscan.xml" \
           "$ssl_h" || true
       else
@@ -1356,7 +1421,7 @@ for host in "${HOSTS[@]}"; do
 
     if [[ "$MODE" != "passive" ]]; then
       if have ffuf; then
-        run_step "ffuf dirs" "ffuf_dirs" "$host_out" ffuf \
+        run_step_limited "ffuf dirs" "ffuf_dirs" "$host_out" ffuf \
           -u "${BEST_URL%/}/FUZZ" \
           -w "$DIR_WL" \
           -mc 200,204,301,302,307,308,401,403,405,500 \
@@ -1371,7 +1436,7 @@ for host in "${HOSTS[@]}"; do
         fi
 
         if [[ "$MODE" == "fast" || "$MODE" == "passive" ]]; then
-          run_step "ffuf files" "ffuf_files" "$host_out" ffuf \
+          run_step_limited "ffuf files" "ffuf_files" "$host_out" ffuf \
             -u "${BEST_URL%/}/FUZZ" \
             -w "$FILE_WL" \
             -mc 200,204,301,302,307,308,401,403,405,500 \
@@ -1380,7 +1445,7 @@ for host in "${HOSTS[@]}"; do
             -of csv \
             -o "$host_out/reports/ffuf_files.csv" || true
         else
-          run_step "ffuf files" "ffuf_files" "$host_out" ffuf \
+          run_step_limited "ffuf files" "ffuf_files" "$host_out" ffuf \
             -u "${BEST_URL%/}/FUZZ" \
             -w "$FILE_WL" \
             -e "$FFUF_EXTENSIONS" \
@@ -1429,7 +1494,7 @@ for host in "${HOSTS[@]}"; do
           KATANA_FFUF_WL="$WL_COMMON"
         fi
 
-        run_step "ffuf (katana dirs)" "ffuf_katana_dirs" "$host_out" \
+        run_step_limited "ffuf (katana dirs)" "ffuf_katana_dirs" "$host_out" \
           bash -c '
             set -euo pipefail
             out="$1"
@@ -1474,7 +1539,7 @@ for host in "${HOSTS[@]}"; do
           FEROX_CLEAN="$host_out/reports/feroxbuster.txt"
           FEROX_403_FILTERED="$host_out/reports/feroxbuster_403_filtered.txt"
           write_fast_ferox_wordlist "$FEROX_FAST_WL"
-          run_step "feroxbuster" "feroxbuster" "$host_out" feroxbuster \
+          run_step_limited "feroxbuster" "feroxbuster" "$host_out" feroxbuster \
             -u "$BEST_URL" \
             -w "$FEROX_FAST_WL" \
             -x "$FEROX_FAST_EXTENSIONS" \
@@ -1492,7 +1557,7 @@ for host in "${HOSTS[@]}"; do
             log_line "DONE: feroxbuster filtered $(count_file "$FEROX_CLEAN")/$(count_file "$FEROX_RAW") lines kept; filtered_403=$(count_file "$FEROX_403_FILTERED")"
           fi
         else
-          run_step "feroxbuster" "feroxbuster" "$host_out" feroxbuster \
+          run_step_limited "feroxbuster" "feroxbuster" "$host_out" feroxbuster \
             -u "$BEST_URL" \
             -w "$DIR_WL" \
             -x "$EXTENSIONS" \
@@ -1514,7 +1579,7 @@ for host in "${HOSTS[@]}"; do
 
     if have gowitness; then
       mkdir -p "$host_out/reports/gowitness/screenshots"
-      run_step "gowitness" "gowitness" "$host_out" gowitness scan file \
+      run_step_limited "gowitness" "gowitness" "$host_out" gowitness scan file \
         -f "$HOST_URLS" \
         --screenshot-path "$host_out/reports/gowitness/screenshots" \
         --write-db \
@@ -1531,7 +1596,7 @@ for host in "${HOSTS[@]}"; do
     mkdir -p "$SUB_WORK"
 
     if have subfinder; then
-      run_step "subfinder" "subfinder" "$host_out" subfinder \
+      run_step_limited "subfinder" "subfinder" "$host_out" subfinder \
         -d "$host" \
         -silent \
         -o "$SUB_WORK/subfinder.txt" || true
@@ -1546,7 +1611,7 @@ for host in "${HOSTS[@]}"; do
     if have bbot; then
       BBOT_OUT="$SUB_WORK/bbot_out"
       mkdir -p "$BBOT_OUT"
-      run_step "bbot" "bbot" "$host_out" bbot \
+      run_step_limited "bbot" "bbot" "$host_out" bbot \
         -t "$host" \
         -f subdomain-enum \
         -rf passive \
@@ -1580,7 +1645,7 @@ for host in "${HOSTS[@]}"; do
 
     if have subzy; then
       if [[ -s "$SUBS_COMBINED" ]]; then
-        run_step "subzy" "subzy" "$host_out" subzy run \
+        run_step_limited "subzy" "subzy" "$host_out" subzy run \
           --targets "$SUBS_COMBINED" \
           --output "$host_out/reports/subzy.json" || true
       else
