@@ -56,7 +56,7 @@ Some tools require:
 
 Single target:
 
-```markdown
+```bash
 ./scopewise.sh -u example.com
 ```
 
@@ -125,6 +125,11 @@ rates:
   ffuf: 50
   ferox: 25
 
+limits:
+  katana_dirs_fast: 15
+  katana_dirs_deep: 50
+  step_timeout_seconds: 5400
+
 wordlists:
   dir: /usr/share/seclists/Discovery/Web-Content/common.txt
   dir_small: /usr/share/seclists/Discovery/Web-Content/raft-small-directories.txt
@@ -132,6 +137,23 @@ wordlists:
   file_small: /usr/share/seclists/Discovery/Web-Content/raft-small-files.txt
   file_medium: /usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt
 ```
+`step_timeout_seconds` controls the automatic timeout for long-running non-core steps.
+
+Default:
+
+```yaml
+limits:
+  step_timeout_seconds: 5400
+```
+
+This equals 90 minutes.
+To disable automatic step timeout:
+
+```yaml
+limits:
+  step_timeout_seconds: 0
+```
+
 The config parser is intentionally simple and supports basic key/value style settings used by ScopeWise.
 
 ## Modes
@@ -160,6 +182,9 @@ Main characteristics:
 - separates low-confidence 403 results into dedicated files
 - generates `reports/summary.md`
 - tracks tool status in `context/tool_status.tsv`
+- allows cancelling the current long-running step with `Ctrl+C`
+- applies a default 90-minute timeout to long-running non-core steps
+- continues the pipeline after manual interruption or timeout
 
 Runs:
 
@@ -266,8 +291,41 @@ For each host:
 25. Detect Cloudflare/edge behavior where applicable.
 26. Split low-confidence Cloudflare/WAF-style 403 results into separate files.
 27. Track tool status in `context/tool_status.tsv`.
-28. Create `reports/summary.md` inside the host output folder.
-29. Print final summary with total runtime and host-level counts.
+28. Record interrupted or timed-out steps where applicable.
+29. Create `reports/summary.md` inside the host output folder.
+30. Print final summary with total runtime and host-level counts.
+
+## Step Interruption and Timeout
+
+ScopeWise is designed to continue running even if a single long-running tool gets stuck.
+
+During a running step, pressing `Ctrl+C` cancels the current step only. ScopeWise records the step as `interrupted`, keeps any output already written by the tool, and continues with the next step.
+
+Long-running non-core steps also have an automatic timeout. By default, the timeout is 90 minutes.
+
+The timeout applies to heavier steps such as:
+
+- `nuclei`
+- `nmap`
+- `nikto`
+- `sslscan`
+- `ffuf`
+- `feroxbuster`
+- `gowitness`
+- `subfinder`
+- `bbot`
+- `subzy`
+
+Core context-building steps are not automatically time-limited by default, because their output is used by later phases. These include:
+
+- base `httpx`
+- `katana`
+- `httpx` on crawled URLs
+- `waybackurls`
+- `httpx` live URL validation
+- JavaScript/API/interesting-file validation
+
+If a step is interrupted or times out, its output may be partial. ScopeWise still creates the expected output files where possible so the rest of the pipeline can continue safely.
 
 ## Output Structure
 
@@ -453,6 +511,12 @@ Possible statuses include:
 - `failed`
 - `empty`
 - `skipped`
+- `timeout`
+- `interrupted`
+
+`timeout` means the step exceeded the configured time limit.
+
+`interrupted` means the user cancelled the current step with `Ctrl+C`.
 
 ## Philosophy
 
