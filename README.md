@@ -185,6 +185,9 @@ Main characteristics:
 - allows cancelling the current long-running step with `Ctrl+C`
 - applies a default 90-minute timeout to long-running non-core steps
 - continues the pipeline after manual interruption or timeout
+- validates discovered subdomains with `httpx`
+- prepares live subdomain URLs for manual follow-up scans
+- includes live subdomain URLs in `gowitness` screenshots
 
 Runs:
 
@@ -203,8 +206,10 @@ Runs:
 - `ffuf` dirs/files
 - `ffuf` on selected directories extracted from crawled URLs
 - `feroxbuster` reduced fast profile
-- `gowitness`, if installed
-- `subfinder`, `bbot`, `subzy`
+- `subfinder` and `bbot` for passive subdomain enumeration
+- `httpx` on discovered subdomains
+- `subzy` for subdomain takeover checks
+- `gowitness`, if installed, for main target URLs and live subdomain URLs
 
 ### `--deep`
 
@@ -285,15 +290,22 @@ For each host:
 19. `ffuf` – file discovery.
 20. `ffuf` on selected directories extracted from crawled URLs.
 21. `feroxbuster` – content discovery.
-22. `gowitness` – screenshots if installed.
-23. `subfinder` and `bbot` – passive subdomain enumeration.
-24. `subzy` – subdomain takeover checks.
-25. Detect Cloudflare/edge behavior where applicable.
-26. Split low-confidence Cloudflare/WAF-style 403 results into separate files.
-27. Track tool status in `context/tool_status.tsv`.
-28. Record interrupted or timed-out steps where applicable.
-29. Create `reports/summary.md` inside the host output folder.
-30. Print final summary with total runtime and host-level counts.
+22. `subfinder` and `bbot` – passive subdomain enumeration.
+23. Build combined subdomain list:
+   - `context/subdomains.txt`
+24. Validate discovered subdomains with `httpx`:
+   - `context/subdomain_urls_source.txt`
+   - `context/live_subdomains.txt`
+   - `context/live_subdomain_urls.txt`
+   - `reports/subdomains_httpx.txt`
+25. `subzy` – subdomain takeover checks.
+26. `gowitness` – screenshots for main target URLs and live subdomain URLs.
+27. Detect Cloudflare/edge behavior where applicable.
+28. Split low-confidence Cloudflare/WAF-style 403 results into separate files.
+29. Track tool status in `context/tool_status.tsv`.
+30. Record interrupted or timed-out steps where applicable.
+31. Create `reports/summary.md` inside the host output folder.
+32. Print final summary with total runtime and host-level counts.
 
 ## Step Interruption and Timeout
 
@@ -391,6 +403,10 @@ scopewise/
                 │    ├── sqli_candidates.txt
                 │    ├── subdomains.txt
                 │    ├── subfinder.txt
+                │    ├── bbot_subdomains.txt
+                │    ├── subdomain_urls_source.txt
+                │    ├── live_subdomains.txt
+                │    ├── live_subdomain_urls.txt
                 │    ├── cloudflare_detected.txt
                 │    ├── edge_provider.txt
                 │    ├── tool_status.tsv
@@ -401,6 +417,7 @@ scopewise/
                 │    └── *.stderr
                 │
                 └── tmp/              # temporary working files
+                     └── gowitness_targets.txt
 ```
 
 ## Important Files To Review
@@ -409,41 +426,36 @@ scopewise/
 
 These are the first files worth opening after a run:
 
-- `reports/summary.md` – per-host summary with key counts, review pointers, Cloudflare/WAF notes and tool status
-- `reports/nuclei_exposures.jsonl` – exposed files, backups, configs, logs, misconfigs
-- `reports/nuclei_takeover.jsonl` – possible subdomain takeover findings
-- `reports/nuclei.jsonl` – general nuclei findings
-- `context/interesting_files_live.txt` – live URLs pointing to backups, configs, databases, logs, maps and similar files
-- `context/api_candidates_live.txt` – live API, Swagger, OpenAPI and GraphQL candidates
-- `context/js_files.txt` – live JavaScript files worth reviewing for endpoints/secrets
-- `context/source_maps.txt` – source map candidates
-- `reports/feroxbuster.txt` – filtered content discovery results
-- `reports/ffuf_files.csv` – file discovery results
-- `reports/ffuf_dirs.csv` – directory discovery results
-- `reports/ffuf_katana_dirs.csv` – selected directory fuzzing results
-- `reports/subzy.json` – subdomain takeover checks
-- `reports/gowitness/` – screenshots and gowitness database/exports
+1. `reports/summary.md` – per-host summary with key counts, review pointers, Cloudflare/WAF notes and tool status
 
-### Raw / Historical Context
+Scanner and finding reports:
 
-These files may contain archived or dead URLs. They are useful for context, but should not be treated as confirmed live findings:
+2. `reports/nuclei_exposures.jsonl` – exposed files, backups, configs, logs, misconfigs
+3. `reports/nuclei_takeover.jsonl` – possible subdomain takeover findings
+4. `reports/nuclei.jsonl` – general nuclei findings
+5. `reports/nikto.json` – Nikto output, if available
+6. `reports/nmap_web.xml` – nmap web-port scan
+7. `reports/sslscan.xml` – TLS scan
+8. `reports/feroxbuster.txt` – filtered content discovery results
+9. `reports/ffuf_files.csv` – file discovery results
+10. `reports/ffuf_dirs.csv` – directory discovery results
+11. `reports/ffuf_katana_dirs.csv` – selected directory fuzzing results
+12. `reports/subzy.json` – subdomain takeover checks
+13. `reports/subdomains_httpx.txt` – live subdomain HTTP probe output
+14. `reports/gowitness/` – screenshots and gowitness database/exports
 
-- `context/all_urls_raw.txt`
-- `context/all_urls.txt`
-- `context/interesting_files_raw.txt`
-- `context/api_candidates_raw.txt`
-- `context/js_files_raw.txt`
-- `context/waybackurls.txt`
-- `reports/feroxbuster.raw.txt`
+Validated context:
 
-### Manual Testing Queues
+15. `context/interesting_files_live.txt` – live URLs pointing to backups, configs, databases, logs, maps and similar files
+16. `context/api_candidates_live.txt` – live API, Swagger, OpenAPI and GraphQL candidates
+17. `context/js_files.txt` – live JavaScript files worth reviewing for endpoints/secrets
+18. `context/live_subdomain_urls.txt` – live subdomain URLs ready for manual follow-up scans
+19. `context/live_subdomains.txt` – live subdomain hostnames
 
-These files are not findings by themselves. Treat them as queues for manual validation:
+Manual queues:
 
-- `context/interesting_params.txt` – broad parameter review list
-- `context/redirect_candidates.txt` – possible open redirect candidates
-- `context/lfi_candidates.txt` – possible file/path/include candidates
-- `context/sqli_candidates.txt` – possible SQLi-like parameter candidates
+20. `context/interesting_params.txt` – raw parameter review queue
+21. `context/source_maps.txt` – source map candidates
 
 ### Surface Mapping / Context
 
@@ -457,8 +469,29 @@ Useful for chaining further scans:
 - `context/waybackurls.txt`
 - `context/subdomains.txt`
 - `context/target_url.txt`
+- `context/subdomains.txt`
+- `context/target_url.txt`
+
+### Live Subdomain Follow-Up
+
+ScopeWise enumerates subdomains and validates which ones are alive, but it does not automatically run the full recon pipeline against every live subdomain.
+
+Useful files:
+
+- `context/subdomains.txt` – all discovered subdomains
+- `context/live_subdomains.txt` – live subdomain hostnames
+- `context/live_subdomain_urls.txt` – live subdomain URLs ready for a follow-up scan
+- `reports/subdomains_httpx.txt` – full `httpx` output for discovered subdomains
+
+To manually run ScopeWise against live subdomains:
+
+```bash
+./scopewise.sh -f scopewise/<RUN_ID>/output/<HOST>/context/live_subdomain_urls.txt --fast
+```
 
 ### Gowitness Review
+
+`gowitness` screenshots include the main target URLs and live subdomain URLs when live subdomains are found.
 
 To review gowitness results from a host folder:
 
@@ -466,12 +499,6 @@ To review gowitness results from a host folder:
 gowitness report server \
   --db-uri "sqlite://reports/gowitness/gowitness.sqlite3" \
   --screenshot-path "reports/gowitness/screenshots"
-```
-
-Then open:
-
-```bash
-http://127.0.0.1:7171
 ```
 
 ### Debug / Troubleshooting Only
@@ -549,6 +576,7 @@ The most important output is not only scanner findings, but the triage queues:
 - SQLi-like parameter candidates
 - source maps
 - screenshots
+- live subdomain URLs for controlled follow-up scans
 
 After that, you are expected to manually validate findings and chain additional tools based on what ScopeWise discovered.
 
