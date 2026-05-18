@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_NAME="scopewise"
-APP_VER="0.3.3"
+APP_VER="0.3.4"
 
 MODE="fast"
 TARGET_SINGLE=""
@@ -973,6 +973,9 @@ write_host_summary() {
 | API candidates raw | $(count_file "$host_out/context/api_candidates_raw.txt") |
 | Live JS files | $(count_file "$host_out/context/js_files.txt") |
 | JS candidates raw | $(count_file "$host_out/context/js_files_raw.txt") |
+| Subdomains | $(count_file "$host_out/context/subdomains.txt") |
+| Live subdomains | $(count_file "$host_out/context/live_subdomains.txt") |
+| Live subdomain URLs | $(count_file "$host_out/context/live_subdomain_urls.txt") |
 | Nuclei findings | $(count_jsonl "$host_out/reports/nuclei.jsonl") |
 | Nuclei exposure findings | $(count_jsonl "$host_out/reports/nuclei_exposures.jsonl") |
 | Nuclei takeover findings | $(count_jsonl "$host_out/reports/nuclei_takeover.jsonl") |
@@ -1022,6 +1025,11 @@ Ctrl+C skips the currently running step, preserves partial output when the under
 - ${BT}context/api_candidates_raw.txt${BT}
 - ${BT}context/js_files_raw.txt${BT}
 - ${BT}context/waybackurls.txt${BT}
+- ${BT}context/subdomains.txt${BT}
+- ${BT}context/subdomain_urls_source.txt${BT}
+- ${BT}context/live_subdomains.txt${BT}
+- ${BT}context/live_subdomain_urls.txt${BT}
+- ${BT}reports/subdomains_httpx.txt${BT}
 - ${BT}reports/feroxbuster.raw.txt${BT}
 
 ## Low-Confidence 403 Queues
@@ -1577,21 +1585,6 @@ for host in "${HOSTS[@]}"; do
       print_skip "feroxbuster (passive mode)"
     fi
 
-    if have gowitness; then
-      mkdir -p "$host_out/reports/gowitness/screenshots"
-      run_step_limited "gowitness" "gowitness" "$host_out" gowitness scan file \
-        -f "$HOST_URLS" \
-        --screenshot-path "$host_out/reports/gowitness/screenshots" \
-        --write-db \
-        --write-db-uri "sqlite://$host_out/reports/gowitness/gowitness.sqlite3" \
-        --write-jsonl \
-        --write-jsonl-file "$host_out/reports/gowitness/gowitness.jsonl" \
-        --write-csv \
-        --write-csv-file "$host_out/reports/gowitness/gowitness.csv" || true
-    else
-      print_skip "gowitness (not installed)"
-    fi
-
     SUB_WORK="$host_out/tmp/subdomains_work"
     mkdir -p "$SUB_WORK"
 
@@ -1642,6 +1635,78 @@ for host in "${HOSTS[@]}"; do
 
     print_done "subdomains -> context/subdomains.txt"
     log_line "DONE: subdomains -> ${SUBS_COMBINED}"
+
+    SUBDOMAIN_URLS_SOURCE="$host_out/context/subdomain_urls_source.txt"
+    LIVE_SUBDOMAIN_URLS="$host_out/context/live_subdomain_urls.txt"
+    LIVE_SUBDOMAINS="$host_out/context/live_subdomains.txt"
+    SUBDOMAINS_HTTPX="$host_out/reports/subdomains_httpx.txt"
+    : >"$SUBDOMAIN_URLS_SOURCE"
+    : >"$LIVE_SUBDOMAIN_URLS"
+    : >"$LIVE_SUBDOMAINS"
+    : >"$SUBDOMAINS_HTTPX"
+
+    if [[ -s "$SUBS_COMBINED" ]]; then
+      while IFS= read -r sub; do
+        [[ -n "$sub" ]] || continue
+        printf 'https://%s\n' "$sub"
+        printf 'http://%s\n' "$sub"
+      done <"$SUBS_COMBINED" | sort -u >"$SUBDOMAIN_URLS_SOURCE"
+
+      if have httpx; then
+        run_step_limited "httpx (subdomains)" "httpx_subdomains" "$host_out" httpx \
+          -l "$SUBDOMAIN_URLS_SOURCE" \
+          -silent \
+          -sc \
+          -cl \
+          -title \
+          -tech-detect \
+          -follow-host-redirects \
+          -ports "$WEB_PORTS" \
+          -rl "$HTTPX_RL" \
+          -o "$SUBDOMAINS_HTTPX" || true
+        awk '$0 ~ /\[(200|204|206|301|302|307|308|401|403)\]/ {print $1}' "$SUBDOMAINS_HTTPX" \
+          | grep -E '^https?://' \
+          | sort -u >"$LIVE_SUBDOMAIN_URLS" || true
+      else
+        print_skip "httpx (subdomains) (not installed)"
+      fi
+
+      if [[ -s "$LIVE_SUBDOMAIN_URLS" ]]; then
+        while IFS= read -r live_url; do
+          url_host "$live_url"
+        done <"$LIVE_SUBDOMAIN_URLS" | sort -u >"$LIVE_SUBDOMAINS"
+      fi
+    else
+      print_skip "httpx (subdomains) (no subdomains)"
+    fi
+
+    print_done "live subdomains: $(count_file "$LIVE_SUBDOMAINS")"
+    print_done "live subdomain urls: $(count_file "$LIVE_SUBDOMAIN_URLS")"
+
+    GOWITNESS_TARGETS="$host_out/tmp/gowitness_targets.txt"
+    {
+      cat "$HOST_URLS" 2>/dev/null || true
+      cat "$LIVE_SUBDOMAIN_URLS" 2>/dev/null || true
+    } | awk 'NF{print}' | sort -u >"$GOWITNESS_TARGETS"
+
+    if have gowitness; then
+      mkdir -p "$host_out/reports/gowitness/screenshots"
+      if [[ -s "$GOWITNESS_TARGETS" ]]; then
+        run_step_limited "gowitness" "gowitness" "$host_out" gowitness scan file \
+          -f "$GOWITNESS_TARGETS" \
+          --screenshot-path "$host_out/reports/gowitness/screenshots" \
+          --write-db \
+          --write-db-uri "sqlite://$host_out/reports/gowitness/gowitness.sqlite3" \
+          --write-jsonl \
+          --write-jsonl-file "$host_out/reports/gowitness/gowitness.jsonl" \
+          --write-csv \
+          --write-csv-file "$host_out/reports/gowitness/gowitness.csv" || true
+      else
+        print_skip "gowitness (no targets)"
+      fi
+    else
+      print_skip "gowitness (not installed)"
+    fi
 
     if have subzy; then
       if [[ -s "$SUBS_COMBINED" ]]; then
