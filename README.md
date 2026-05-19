@@ -33,6 +33,7 @@ ScopeWise is only an orchestrator. All credit goes to the original authors of th
 - [bbot](https://github.com/blacklanternsecurity/bbot)
 - [subzy](https://github.com/PentestPad/subzy)
 - [waybackurls](https://github.com/tomnomnom/waybackurls)
+- [wafw00f](https://github.com/EnableSecurity/wafw00f)
 
 Huge thanks to all tool authors.
 
@@ -118,6 +119,8 @@ mode: fast
 ports:
   fast: "80,443"
   deep: "80,443,8080,8443,8000,8888,3000,5000,9000"
+  nmap_web: "80,443"
+  nmap_recon: "21,22,25,53,80,110,111,135,139,143,389,443,445,465,587,636,993,995,1433,1521,2049,2375,2376,3000,3306,3389,5000,5432,5601,5900,5985,5986,6379,8000,8080,8081,8443,8888,9000,9200,9300,11211,27017"
 
 rates:
   httpx: 80
@@ -188,6 +191,9 @@ Main characteristics:
 - validates discovered subdomains with `httpx`
 - prepares live subdomain URLs for manual follow-up scans
 - includes live subdomain URLs in `gowitness` screenshots
+- optionally runs `wafw00f` for additional WAF/CDN detection
+- dynamically selects Nmap ports based on WAF/CDN detection
+- runs fast-mode Nmap without default NSE scripts
 
 Runs:
 
@@ -200,7 +206,8 @@ Runs:
 - `nuclei` exposure/misconfig scan
 - `nuclei` takeover scan
 - `nuclei` JavaScript exposure scan against live JS files only
-- `nmap` on common web ports
+- `wafw00f`, if installed
+- `nmap` with WAF/CDN-aware port selection
 - `nikto`
 - `sslscan`
 - `ffuf` dirs/files
@@ -223,6 +230,8 @@ Main differences:
 - larger wordlists
 - broader content discovery
 - more suitable for promising targets or when program rules allow heavier recon
+
+In `--deep`, Nmap keeps default NSE scripts enabled.
 
 Use this only when you want a more complete scan and can accept longer runtime.
 
@@ -284,6 +293,8 @@ For each host:
 13. `nuclei` takeover scan.
 14. `nuclei` JavaScript exposure scan, only if live JS files were found.
 15. `nmap` – service detection on common web ports.
+    - WAF/CDN detected: scan web/edge ports only.
+    - No WAF/CDN detected: scan popular recon ports.
 16. `nikto` – common web misconfiguration scan.
 17. `sslscan` – TLS analysis.
 18. `ffuf` – directory discovery.
@@ -300,7 +311,7 @@ For each host:
    - `reports/subdomains_httpx.txt`
 25. `subzy` – subdomain takeover checks.
 26. `gowitness` – screenshots for main target URLs and live subdomain URLs.
-27. Detect Cloudflare/edge behavior where applicable.
+27. Detect Cloudflare/edge behavior where applicable. Run `wafw00f`, if installed, for additional WAF/CDN detection.
 28. Split low-confidence Cloudflare/WAF-style 403 results into separate files.
 29. Track tool status in `context/tool_status.tsv`.
 30. Record interrupted or timed-out steps where applicable.
@@ -353,6 +364,7 @@ scopewise/
            └── target.com/
                 ├── reports/          # findings and scan outputs to review first
                 |    ├── summary.md  # short per-host review guide
+                │    ├── wafw00f.txt
                 │    ├── nuclei.jsonl
                 │    ├── nuclei_exposures.jsonl
                 │    ├── nuclei_takeover.jsonl
@@ -395,6 +407,10 @@ scopewise/
                 │    ├── api_candidates_raw.txt
                 │    ├── api_candidates_live.txt
                 │    ├── api_candidates.txt
+                │    ├── waf_detected.txt
+                │    ├── waf_provider.txt
+                │    ├── nmap_mode.txt
+                │    ├── nmap_ports.txt
                 │    ├── js_files_raw.txt
                 │    ├── js_files.txt
                 │    ├── source_maps.txt
@@ -443,6 +459,7 @@ Scanner and finding reports:
 12. `reports/subzy.json` – subdomain takeover checks
 13. `reports/subdomains_httpx.txt` – live subdomain HTTP probe output
 14. `reports/gowitness/` – screenshots and gowitness database/exports
+15. `reports/wafw00f.txt` – WAF/CDN detection output, if available
 
 Validated context:
 
@@ -471,6 +488,10 @@ Useful for chaining further scans:
 - `context/target_url.txt`
 - `context/subdomains.txt`
 - `context/target_url.txt`
+- `context/waf_detected.txt`
+- `context/waf_provider.txt`
+- `context/nmap_mode.txt`
+- `context/nmap_ports.txt`
 
 ### Live Subdomain Follow-Up
 
@@ -510,20 +531,27 @@ Not intended for vulnerability analysis unless troubleshooting:
 - `tmp/`
 - `scopewise.log`
 
-### Cloudflare / WAF Context
+### WAF / CDN Context
 
-If Cloudflare is detected, ScopeWise keeps scanning normally but separates low-confidence 403 results.
+If Cloudflare or another WAF/CDN is detected, ScopeWise keeps scanning normally but treats edge/WAF-sensitive results carefully.
 
 Review:
 
 - `context/cloudflare_detected.txt`
 - `context/edge_provider.txt`
+- `context/waf_detected.txt`
+- `context/waf_provider.txt`
+- `context/nmap_mode.txt`
+- `context/nmap_ports.txt`
+- `reports/wafw00f.txt`
 - `reports/ffuf_dirs_403.csv`
 - `reports/ffuf_files_403.csv`
 - `reports/ffuf_katana_dirs_403.csv`
 - `reports/feroxbuster_403_filtered.txt`
 
-When Cloudflare is detected, `nmap`, `sslscan`, `nikto` and many 403 responses may describe edge/WAF behavior rather than the origin application.
+When a WAF/CDN is detected, `nmap`, `sslscan`, `nikto` and many 403 responses may describe edge/WAF behavior rather than the origin application.
+
+In that case, ScopeWise limits Nmap to web/edge ports. If no WAF/CDN is detected, ScopeWise scans a broader list of common high-value recon ports.
 
 ### Tool Status
 
@@ -557,6 +585,7 @@ It performs:
 - baseline checks
 - quick bounty triage
 - structured output for manual review
+- WAF/CDN-aware interpretation and Nmap port selection
 
 It does not replace manual testing.
 
