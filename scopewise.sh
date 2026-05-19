@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_NAME="scopewise"
-APP_VER="0.3.4"
+APP_VER="0.3.5"
 
 MODE="fast"
 TARGET_SINGLE=""
@@ -14,6 +14,8 @@ STEP_MAX_SECONDS="5400"
 
 WEB_PORTS="80,443"
 WEB_PORTS_DEEP="80,443,8080,8443,8000,8888,3000,5000,9000"
+NMAP_WEB_PORTS="80,443"
+NMAP_RECON_PORTS="21,22,25,53,80,110,111,135,139,143,389,443,445,465,587,636,993,995,1433,1521,2049,2375,2376,3000,3306,3389,5000,5432,5601,5900,5985,5986,6379,8000,8080,8081,8443,8888,9000,9200,9300,11211,27017"
 EXTENSIONS="js,json,xml,txt,log,bak,backup,old,zip,tar,gz,tgz,sql,db,sqlite,env,config,conf,ini,yml,yaml,map"
 FEROX_FAST_EXTENSIONS="json,txt,log,bak,backup,old,zip,sql,db,sqlite,env,config,conf,ini,yml,yaml,map"
 FFUF_EXTENSIONS=".js,.json,.xml,.txt,.log,.bak,.backup,.old,.zip,.tar.gz,.tgz,.sql,.db,.sqlite,.env,.config,.conf,.ini,.yml,.yaml,.map"
@@ -506,6 +508,8 @@ load_config() {
       ports.fast) CONFIG_PORTS_FAST="$val" ;;
       ports.deep) CONFIG_PORTS_DEEP="$val" ;;
       ports.passive) CONFIG_PORTS_PASSIVE="$val" ;;
+      ports.nmap_web) CONFIG_NMAP_WEB_PORTS="$val" ;;
+      ports.nmap_recon) CONFIG_NMAP_RECON_PORTS="$val" ;;
       rates.httpx) CONFIG_HTTPX_RL="$val" ;;
       rates.nuclei) CONFIG_NUCLEI_RL="$val" ;;
       rates.nuclei_concurrency) CONFIG_NUCLEI_C="$val" ;;
@@ -557,6 +561,8 @@ apply_config_overrides() {
   NUCLEI_C="${CONFIG_NUCLEI_C:-$NUCLEI_C}"
   FFUF_RATE="${CONFIG_FFUF_RATE:-$FFUF_RATE}"
   FEROX_RL="${CONFIG_FEROX_RL:-$FEROX_RL}"
+  NMAP_WEB_PORTS="${CONFIG_NMAP_WEB_PORTS:-$NMAP_WEB_PORTS}"
+  NMAP_RECON_PORTS="${CONFIG_NMAP_RECON_PORTS:-$NMAP_RECON_PORTS}"
 }
 
 check_file_status() {
@@ -570,7 +576,7 @@ check_file_status() {
 }
 
 run_dependency_check() {
-  local tools=(httpx katana nuclei nmap nikto sslscan ffuf feroxbuster gowitness subfinder bbot subzy waybackurls)
+  local tools=(httpx katana nuclei nmap wafw00f nikto sslscan ffuf feroxbuster gowitness subfinder bbot subzy waybackurls)
   local t=""
   printf 'ScopeWise dependency check\n\n'
   printf 'Mode: %s\n' "$MODE"
@@ -600,6 +606,8 @@ run_dependency_check() {
   printf '  ferox depth: %s\n' "$FEROX_DEPTH"
   printf '  dir wordlist: %s\n' "$DIR_WL"
   printf '  file wordlist: %s\n' "$FILE_WL"
+  printf '  nmap web ports: %s\n' "$NMAP_WEB_PORTS"
+  printf '  nmap recon ports: %s\n' "$NMAP_RECON_PORTS"
   printf '  step timeout seconds: %s\n' "$STEP_MAX_SECONDS"
 }
 
@@ -739,6 +747,35 @@ detect_cloudflare() {
   local input="$1"
   [[ -s "$input" ]] || return 1
   grep -Eiq 'cloudflare|cf-ray|cf-cache-status|cf-mitigated|__cf_bm|cf-chl|cdn-cgi' "$input"
+}
+
+extract_wafw00f_provider() {
+  local input="$1"
+  [[ -s "$input" ]] || { printf 'none\n'; return 1; }
+
+  if grep -Eiq 'No WAF detected|generic detection|seems to be behind no WAF|not behind a WAF' "$input"; then
+    printf 'none\n'
+    return 1
+  fi
+
+  if grep -Eiq 'cloudflare' "$input"; then printf 'cloudflare\n'; return 0; fi
+  if grep -Eiq 'akamai' "$input"; then printf 'akamai\n'; return 0; fi
+  if grep -Eiq 'aws|amazon' "$input"; then printf 'aws_waf\n'; return 0; fi
+  if grep -Eiq 'imperva|incapsula' "$input"; then printf 'imperva\n'; return 0; fi
+  if grep -Eiq 'sucuri' "$input"; then printf 'sucuri\n'; return 0; fi
+  if grep -Eiq 'fastly' "$input"; then printf 'fastly\n'; return 0; fi
+  if grep -Eiq 'f5|big-ip' "$input"; then printf 'f5_bigip\n'; return 0; fi
+  if grep -Eiq 'barracuda' "$input"; then printf 'barracuda\n'; return 0; fi
+  if grep -Eiq 'mod.?security' "$input"; then printf 'modsecurity\n'; return 0; fi
+  if grep -Eiq 'fortinet|fortiweb' "$input"; then printf 'fortinet\n'; return 0; fi
+
+  if grep -Eiq 'is behind|behind .*WAF|WAF detected|protected by' "$input"; then
+    printf 'generic_waf\n'
+    return 0
+  fi
+
+  printf 'none\n'
+  return 1
 }
 
 split_ffuf_403_csv() {
@@ -923,6 +960,10 @@ write_host_summary() {
   local summary="$host_out/reports/summary.md"
   local cf="no"
   local edge="unknown"
+  local waf="no"
+  local waf_provider="none"
+  local nmap_mode="unknown"
+  local nmap_ports=""
   local cf_note=""
   local status_file="$host_out/context/tool_status.tsv"
   local ok_count=0
@@ -938,11 +979,15 @@ write_host_summary() {
 
   [[ -f "$host_out/context/cloudflare_detected.txt" ]] && cf="$(cat "$host_out/context/cloudflare_detected.txt" 2>/dev/null | head -n 1)"
   [[ -f "$host_out/context/edge_provider.txt" ]] && edge="$(cat "$host_out/context/edge_provider.txt" 2>/dev/null | head -n 1)"
+  [[ -f "$host_out/context/waf_detected.txt" ]] && waf="$(cat "$host_out/context/waf_detected.txt" 2>/dev/null | head -n 1)"
+  [[ -f "$host_out/context/waf_provider.txt" ]] && waf_provider="$(cat "$host_out/context/waf_provider.txt" 2>/dev/null | head -n 1)"
+  [[ -f "$host_out/context/nmap_mode.txt" ]] && nmap_mode="$(cat "$host_out/context/nmap_mode.txt" 2>/dev/null | head -n 1)"
+  [[ -f "$host_out/context/nmap_ports.txt" ]] && nmap_ports="$(cat "$host_out/context/nmap_ports.txt" 2>/dev/null | head -n 1)"
 
-  if [[ "$cf" == "yes" ]]; then
-    cf_note="Cloudflare/WAF was detected. Treat 403 results as low-confidence edge/WAF responses unless the body confirms a real resource. nmap and sslscan likely describe the edge, not the origin."
+  if [[ "$cf" == "yes" || "$waf" == "yes" ]]; then
+    cf_note="Cloudflare/WAF/CDN was detected. Treat 403 results as low-confidence edge/WAF responses unless the body confirms a real resource. nmap and sslscan may describe the edge, not the origin."
   else
-    cf_note="No Cloudflare signal detected by ScopeWise."
+    cf_note="No Cloudflare/WAF/CDN signal detected by ScopeWise."
   fi
 
   if [[ -s "$status_file" ]]; then
@@ -951,6 +996,8 @@ write_host_summary() {
     failed_count="$(awk -F'\t' '$2=="failed"{c++} END{print c+0}' "$status_file")"
     skipped_count="$(awk -F'\t' '$2=="skipped"{c++} END{print c+0}' "$status_file")"
     empty_count="$(awk -F'\t' '$2=="empty"{c++} END{print c+0}' "$status_file")"
+    timeout_count="$(awk -F'\t' '$2=="timeout"{c++} END{print c+0}' "$status_file")"
+    interrupted_count="$(awk -F'\t' '$2=="interrupted"{c++} END{print c+0}' "$status_file")"
   fi
 
   cat >"$summary" <<EOF_SUMMARY
@@ -964,6 +1011,10 @@ write_host_summary() {
 | Mode | $MODE |
 | Cloudflare | $cf |
 | Edge provider | $edge |
+| WAF/CDN detected | $waf |
+| WAF/CDN provider | $waf_provider |
+| Nmap mode | $nmap_mode |
+| Nmap ports | $nmap_ports |
 | Host time | $(format_duration "$host_elapsed") |
 | Live URLs | $(count_file "$host_out/context/all_urls_live.txt") |
 | Raw URLs | $(count_file "$host_out/context/all_urls_raw.txt") |
@@ -1004,7 +1055,8 @@ Ctrl+C skips the currently running step, preserves partial output when the under
 - ${BT}reports/nuclei_takeover.jsonl${BT} \u2013 possible subdomain takeover findings
 - ${BT}reports/nuclei.jsonl${BT} \u2013 general nuclei findings
 - ${BT}reports/nikto.json${BT} \u2013 Nikto output, if available
-- ${BT}reports/nmap_web.xml${BT} \u2013 nmap web-port scan
+- ${BT}reports/nmap_web.xml${BT} \u2013 nmap scan; ports depend on WAF/CDN detection and mode
+- ${BT}reports/wafw00f.txt${BT} \u2013 WAF/CDN detection output, if available
 - ${BT}reports/sslscan.xml${BT} \u2013 TLS scan
 - ${BT}context/interesting_files_live.txt${BT} \u2013 live interesting files
 - ${BT}context/api_candidates_live.txt${BT} \u2013 live API candidates
@@ -1029,7 +1081,12 @@ Ctrl+C skips the currently running step, preserves partial output when the under
 - ${BT}context/subdomain_urls_source.txt${BT}
 - ${BT}context/live_subdomains.txt${BT}
 - ${BT}context/live_subdomain_urls.txt${BT}
+- ${BT}context/waf_detected.txt${BT}
+- ${BT}context/waf_provider.txt${BT}
+- ${BT}context/nmap_mode.txt${BT}
+- ${BT}context/nmap_ports.txt${BT}
 - ${BT}reports/subdomains_httpx.txt${BT}
+- ${BT}reports/wafw00f.txt${BT}
 - ${BT}reports/feroxbuster.raw.txt${BT}
 
 ## Low-Confidence 403 Queues
@@ -1230,10 +1287,18 @@ for host in "${HOSTS[@]}"; do
     printf '%s\n' "$BEST_URL" >"$host_out/context/target_url.txt"
 
     CLOUDFLARE_DETECTED=0
+    WAF_DETECTED=0
+    EDGE_OR_WAF_DETECTED=0
+    WAF_PROVIDER="none"
     EDGE_PROVIDER_FILE="$host_out/context/edge_provider.txt"
     CLOUDFLARE_FILE="$host_out/context/cloudflare_detected.txt"
+    WAF_FILE="$host_out/context/waf_detected.txt"
+    WAF_PROVIDER_FILE="$host_out/context/waf_provider.txt"
     if detect_cloudflare "$HOST_HTTPX_RAW"; then
       CLOUDFLARE_DETECTED=1
+      EDGE_OR_WAF_DETECTED=1
+      WAF_DETECTED=1
+      WAF_PROVIDER="cloudflare"
       printf 'yes\n' >"$CLOUDFLARE_FILE"
       printf 'cloudflare\n' >"$EDGE_PROVIDER_FILE"
       print_warn "Cloudflare detected; 403, nmap, sslscan and nikto results may describe edge/WAF behavior"
@@ -1241,6 +1306,29 @@ for host in "${HOSTS[@]}"; do
     else
       printf 'no\n' >"$CLOUDFLARE_FILE"
       printf 'unknown\n' >"$EDGE_PROVIDER_FILE"
+    fi
+
+    if have wafw00f; then
+      run_step_limited "wafw00f" "wafw00f" "$host_out" wafw00f "$BEST_URL" -a || true
+      cp -f "$host_out/debug/wafw00f.stdout" "$host_out/reports/wafw00f.txt" 2>/dev/null || true
+      waf_provider_found="$(extract_wafw00f_provider "$host_out/reports/wafw00f.txt" 2>/dev/null || true)"
+      if [[ -n "$waf_provider_found" && "$waf_provider_found" != "none" ]]; then
+        WAF_DETECTED=1
+        EDGE_OR_WAF_DETECTED=1
+        WAF_PROVIDER="$waf_provider_found"
+        print_warn "WAF/CDN detected by wafw00f: $WAF_PROVIDER"
+        log_line "WARN: wafw00f detected ${WAF_PROVIDER} for ${host}"
+      fi
+    else
+      print_skip "wafw00f (not installed)"
+    fi
+
+    if [[ "$WAF_DETECTED" -eq 1 ]]; then
+      printf 'yes\n' >"$WAF_FILE"
+      printf '%s\n' "$WAF_PROVIDER" >"$WAF_PROVIDER_FILE"
+    else
+      printf 'no\n' >"$WAF_FILE"
+      printf 'none\n' >"$WAF_PROVIDER_FILE"
     fi
 
     KATANA_RAW="$host_out/context/katana.txt"
@@ -1372,14 +1460,34 @@ for host in "${HOSTS[@]}"; do
 
     if [[ "$MODE" != "passive" ]]; then
       if have nmap; then
-        run_step_limited "nmap" "nmap" "$host_out" nmap \
-          -sS \
-          -sV \
-          -sC \
-          -T3 \
-          -p "$WEB_PORTS" \
-          -oA "$host_out/reports/nmap_web" \
-          "$host" || true
+        if [[ "${EDGE_OR_WAF_DETECTED:-0}" -eq 1 ]]; then
+          NMAP_PORTS_SELECTED="$NMAP_WEB_PORTS"
+          NMAP_MODE="edge_web_ports"
+        else
+          NMAP_PORTS_SELECTED="$NMAP_RECON_PORTS"
+          NMAP_MODE="recon_ports"
+        fi
+        printf '%s\n' "$NMAP_PORTS_SELECTED" >"$host_out/context/nmap_ports.txt"
+        printf '%s\n' "$NMAP_MODE" >"$host_out/context/nmap_mode.txt"
+        if [[ "$MODE" == "deep" ]]; then
+          run_step_limited "nmap" "nmap" "$host_out" nmap \
+            -sS \
+            -sV \
+            -sC \
+            -T3 \
+            -p "$NMAP_PORTS_SELECTED" \
+            -oA "$host_out/reports/nmap_web" \
+            "$host" || true
+        else
+          run_step_limited "nmap" "nmap" "$host_out" nmap \
+            -sS \
+            -sV \
+            --version-light \
+            -T3 \
+            -p "$NMAP_PORTS_SELECTED" \
+            -oA "$host_out/reports/nmap_web" \
+            "$host" || true
+        fi
       else
         print_skip "nmap (not installed)"
       fi
@@ -1437,7 +1545,7 @@ for host in "${HOSTS[@]}"; do
           -rate "$FFUF_RATE" \
           -of csv \
           -o "$host_out/reports/ffuf_dirs.csv" || true
-        if [[ "${CLOUDFLARE_DETECTED:-0}" -eq 1 && -s "$host_out/reports/ffuf_dirs.csv" ]]; then
+        if [[ "${EDGE_OR_WAF_DETECTED:-0}" -eq 1 && -s "$host_out/reports/ffuf_dirs.csv" ]]; then
           split_ffuf_403_csv "$host_out/reports/ffuf_dirs.csv" "$host_out/reports/ffuf_dirs.no403.csv" "$host_out/reports/ffuf_dirs_403.csv"
           mv -f "$host_out/reports/ffuf_dirs.no403.csv" "$host_out/reports/ffuf_dirs.csv"
           print_done "ffuf dirs 403 split: $(count_file "$host_out/reports/ffuf_dirs_403.csv") lines"
@@ -1463,7 +1571,7 @@ for host in "${HOSTS[@]}"; do
             -of csv \
             -o "$host_out/reports/ffuf_files.csv" || true
         fi
-        if [[ "${CLOUDFLARE_DETECTED:-0}" -eq 1 && -s "$host_out/reports/ffuf_files.csv" ]]; then
+        if [[ "${EDGE_OR_WAF_DETECTED:-0}" -eq 1 && -s "$host_out/reports/ffuf_files.csv" ]]; then
           split_ffuf_403_csv "$host_out/reports/ffuf_files.csv" "$host_out/reports/ffuf_files.no403.csv" "$host_out/reports/ffuf_files_403.csv"
           mv -f "$host_out/reports/ffuf_files.no403.csv" "$host_out/reports/ffuf_files.csv"
           print_done "ffuf files 403 split: $(count_file "$host_out/reports/ffuf_files_403.csv") lines"
@@ -1526,7 +1634,7 @@ for host in "${HOSTS[@]}"; do
               rm -f "$tmp_out"
             done < "$4"
           ' bash "$host_out/reports/ffuf_katana_dirs.csv" "$KATANA_FFUF_WL" "$FFUF_RATE" "$KATANA_DIRS" || true
-        if [[ "${CLOUDFLARE_DETECTED:-0}" -eq 1 && -s "$host_out/reports/ffuf_katana_dirs.csv" ]]; then
+        if [[ "${EDGE_OR_WAF_DETECTED:-0}" -eq 1 && -s "$host_out/reports/ffuf_katana_dirs.csv" ]]; then
           split_ffuf_403_csv "$host_out/reports/ffuf_katana_dirs.csv" "$host_out/reports/ffuf_katana_dirs.no403.csv" "$host_out/reports/ffuf_katana_dirs_403.csv"
           mv -f "$host_out/reports/ffuf_katana_dirs.no403.csv" "$host_out/reports/ffuf_katana_dirs.csv"
           print_done "ffuf katana dirs 403 split: $(count_file "$host_out/reports/ffuf_katana_dirs_403.csv") lines"
@@ -1559,7 +1667,7 @@ for host in "${HOSTS[@]}"; do
             --dont-extract-links \
             --quiet \
             -o "$FEROX_RAW" || true
-          filter_ferox_fast_output "$FEROX_RAW" "$FEROX_CLEAN" "$FEROX_403_FILTERED" "${CLOUDFLARE_DETECTED:-0}"
+          filter_ferox_fast_output "$FEROX_RAW" "$FEROX_CLEAN" "$FEROX_403_FILTERED" "${EDGE_OR_WAF_DETECTED:-0}"
           if [[ -s "$FEROX_RAW" ]]; then
             print_done "feroxbuster filtered: $(count_file "$FEROX_CLEAN")/$(count_file "$FEROX_RAW") lines kept"
             log_line "DONE: feroxbuster filtered $(count_file "$FEROX_CLEAN")/$(count_file "$FEROX_RAW") lines kept; filtered_403=$(count_file "$FEROX_403_FILTERED")"
