@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_NAME="scopewise"
-APP_VER="0.3.5"
+APP_VER="0.3.6"
 
 MODE="fast"
 TARGET_SINGLE=""
@@ -11,6 +11,8 @@ CONFIG_FILE=""
 CHECK_ONLY=0
 MODE_CLI=""
 STEP_MAX_SECONDS="5400"
+PARAM_CHECK_LIMIT="25"
+DSSS_CMD="dsss"
 
 WEB_PORTS="80,443"
 WEB_PORTS_DEEP="80,443,8080,8443,8000,8888,3000,5000,9000"
@@ -530,6 +532,8 @@ load_config() {
       limits.katana_dirs_fast) CONFIG_KATANA_DIR_LIMIT_FAST="$val" ;;
       limits.katana_dirs_deep) CONFIG_KATANA_DIR_LIMIT_DEEP="$val" ;;
       limits.step_timeout_seconds) STEP_MAX_SECONDS="$val" ;;
+      limits.param_check_urls) PARAM_CHECK_LIMIT="$val" ;;
+      tools.dsss_cmd) DSSS_CMD="$val" ;;
     esac
   done <"$cfg"
 }
@@ -576,7 +580,7 @@ check_file_status() {
 }
 
 run_dependency_check() {
-  local tools=(httpx katana nuclei nmap wafw00f nikto sslscan ffuf feroxbuster gowitness subfinder bbot subzy waybackurls)
+  local tools=(httpx katana nuclei nmap wafw00f nikto sslscan ffuf feroxbuster gowitness subfinder bbot subzy waybackurls dalfox)
   local t=""
   printf 'ScopeWise dependency check\n\n'
   printf 'Mode: %s\n' "$MODE"
@@ -589,6 +593,13 @@ run_dependency_check() {
       printf '  %-14s missing\n' "$t"
     fi
   done
+  if have "$DSSS_CMD"; then
+    printf '  %-14s OK      %s\n' "dsss" "$DSSS_CMD"
+  elif [[ -f "$DSSS_CMD" ]] && have python3; then
+    printf '  %-14s OK      %s\n' "dsss" "$DSSS_CMD"
+  else
+    printf '  %-14s missing %s\n' "dsss" "$DSSS_CMD"
+  fi
   printf '\nConfigured wordlists:\n'
   check_file_status "common" "$WL_COMMON"
   check_file_status "dir small" "$WL_DIR_SMALL"
@@ -609,6 +620,8 @@ run_dependency_check() {
   printf '  nmap web ports: %s\n' "$NMAP_WEB_PORTS"
   printf '  nmap recon ports: %s\n' "$NMAP_RECON_PORTS"
   printf '  step timeout seconds: %s\n' "$STEP_MAX_SECONDS"
+  printf '  param check url limit: %s\n' "$PARAM_CHECK_LIMIT"
+  printf '  dsss command: %s\n' "$DSSS_CMD"
 }
 
 count_jsonl() {
@@ -857,6 +870,9 @@ extract_context_files() {
   : >"$host_out/context/js_files_raw.txt"
   : >"$host_out/context/js_files.txt"
   : >"$host_out/context/source_maps.txt"
+  : >"$host_out/context/xss_candidates.txt"
+  : >"$host_out/context/xss_candidates_active.txt"
+  : >"$host_out/context/sqli_candidates_active.txt"
   : >"$host_out/context/redirect_candidates.txt"
   : >"$host_out/context/lfi_candidates.txt"
   : >"$host_out/context/sqli_candidates.txt"
@@ -868,6 +884,9 @@ extract_context_files() {
 
   grep -Ei 'redirect=|url=|next=|return=|dest=|destination=|continue=|callback=|file=|path=|folder=|doc=|document=|template=|page=|id=|user=|account=|debug=|token=|key=|secret=|api' "$all_urls_raw" \
     | sort -u >"$host_out/context/interesting_params.txt" || true
+
+  grep -Ei '[?&](q|s|search|query|keyword|term|message|comment|name|email|title|text|content|callback|return|next|url|redirect|dest|destination|continue)=' "$all_urls_raw" \
+    | sort -u >"$host_out/context/xss_candidates.txt" || true
 
   grep -Ei '/api/|/v1/|/v2/|/v3/|graphql|graphiql|swagger|openapi|api-docs|swagger-ui' "$all_urls_raw" \
     | sort -u >"$host_out/context/api_candidates_raw.txt" || true
@@ -941,6 +960,94 @@ validate_live_js_files() {
       | sort -u >"$live_js" || true
   else
     cp -f "$clean_js" "$live_js"
+  fi
+}
+
+prepare_active_param_candidates() {
+  local source_file="$1"
+  local live_urls="$2"
+  local output_file="$3"
+  local limit="${4:-0}"
+  local tmp_clean="${output_file}.clean.tmp"
+  local tmp_live="${output_file}.live.tmp"
+
+  : >"$output_file"
+  : >"$tmp_clean"
+  : >"$tmp_live"
+
+  clean_url_list "$source_file" "$tmp_clean"
+  [[ -s "$tmp_clean" ]] || {
+    rm -f "$tmp_clean" "$tmp_live"
+    return 0
+  }
+
+  if [[ -s "$live_urls" ]]; then
+    grep -Fxf "$tmp_clean" "$live_urls" | sort -u >"$tmp_live" || true
+  else
+    cp -f "$tmp_clean" "$tmp_live"
+  fi
+
+  if [[ -s "$tmp_live" ]]; then
+    if [[ "$limit" =~ ^[0-9]+$ && "$limit" -gt 0 ]]; then
+      head -n "$limit" "$tmp_live" >"$output_file"
+    else
+      cp -f "$tmp_live" "$output_file"
+    fi
+  fi
+
+  rm -f "$tmp_clean" "$tmp_live"
+}
+
+run_dalfox_check() {
+  local host_out="$1"
+  local input_file="$2"
+  local output_file="$host_out/reports/dalfox_xss.txt"
+  : >"$output_file"
+
+  if [[ ! -s "$input_file" ]]; then
+    print_skip "dalfox xss (no candidates)"
+    return 0
+  fi
+
+  if have dalfox; then
+    run_step_limited "dalfox xss" "dalfox_xss" "$host_out" dalfox file "$input_file" --silence --output "$output_file" || true
+  else
+    print_skip "dalfox xss (not installed)"
+  fi
+}
+
+run_dsss_check() {
+  local host_out="$1"
+  local input_file="$2"
+  local output_file="$host_out/reports/dsss_sqli.txt"
+  : >"$output_file"
+
+  if [[ ! -s "$input_file" ]]; then
+    print_skip "dsss sqli (no candidates)"
+    return 0
+  fi
+
+  if have "$DSSS_CMD" || { [[ -f "$DSSS_CMD" ]] && have python3; }; then
+    run_step_limited "dsss sqli" "dsss_sqli" "$host_out" \
+      bash -c '
+        set -euo pipefail
+        cmd="$1"
+        input="$2"
+        output="$3"
+        : >"$output"
+        while IFS= read -r url; do
+          [[ -n "$url" ]] || continue
+          printf "### %s\n" "$url" >>"$output"
+          if [[ -f "$cmd" ]]; then
+            python3 "$cmd" -u "$url" >>"$output" 2>&1 || true
+          else
+            "$cmd" -u "$url" >>"$output" 2>&1 || true
+          fi
+          printf "\n" >>"$output"
+        done <"$input"
+      ' bash "$DSSS_CMD" "$input_file" "$output_file" || true
+  else
+    print_skip "dsss sqli (not installed)"
   fi
 }
 
@@ -1027,10 +1134,16 @@ write_host_summary() {
 | Subdomains | $(count_file "$host_out/context/subdomains.txt") |
 | Live subdomains | $(count_file "$host_out/context/live_subdomains.txt") |
 | Live subdomain URLs | $(count_file "$host_out/context/live_subdomain_urls.txt") |
+| XSS candidates | $(count_file "$host_out/context/xss_candidates.txt") |
+| XSS active candidates | $(count_file "$host_out/context/xss_candidates_active.txt") |
+| SQLi candidates | $(count_file "$host_out/context/sqli_candidates.txt") |
+| SQLi active candidates | $(count_file "$host_out/context/sqli_candidates_active.txt") |
 | Nuclei findings | $(count_jsonl "$host_out/reports/nuclei.jsonl") |
 | Nuclei exposure findings | $(count_jsonl "$host_out/reports/nuclei_exposures.jsonl") |
 | Nuclei takeover findings | $(count_jsonl "$host_out/reports/nuclei_takeover.jsonl") |
 | Nuclei JS findings | $(count_jsonl "$host_out/reports/nuclei_js_exposure.jsonl") |
+| Dalfox output lines | $(count_file "$host_out/reports/dalfox_xss.txt") |
+| DSSS output lines | $(count_file "$host_out/reports/dsss_sqli.txt") |
 | FFUF dirs | $(count_csv_data "$host_out/reports/ffuf_dirs.csv") |
 | FFUF dirs 403 | $(count_csv_data "$host_out/reports/ffuf_dirs_403.csv") |
 | FFUF files | $(count_csv_data "$host_out/reports/ffuf_files.csv") |
@@ -1076,6 +1189,9 @@ Ctrl+C skips the currently running step, preserves partial output when the under
 - ${BT}context/interesting_files_raw.txt${BT}
 - ${BT}context/api_candidates_raw.txt${BT}
 - ${BT}context/js_files_raw.txt${BT}
+- ${BT}context/xss_candidates.txt${BT}
+- ${BT}context/xss_candidates_active.txt${BT}
+- ${BT}context/sqli_candidates_active.txt${BT}
 - ${BT}context/waybackurls.txt${BT}
 - ${BT}context/subdomains.txt${BT}
 - ${BT}context/subdomain_urls_source.txt${BT}
@@ -1098,6 +1214,7 @@ Ctrl+C skips the currently running step, preserves partial output when the under
 
 ## Manual Queues
 
+- ${BT}context/xss_candidates.txt${BT}
 - ${BT}context/redirect_candidates.txt${BT}
 - ${BT}context/lfi_candidates.txt${BT}
 - ${BT}context/sqli_candidates.txt${BT}
@@ -1410,6 +1527,18 @@ for host in "${HOSTS[@]}"; do
     print_done "api candidates live: $(count_file "$host_out/context/api_candidates_live.txt")"
     print_done "js candidates: $(count_file "$host_out/context/js_files_raw.txt")"
     print_done "live js files: $(count_file "$host_out/context/js_files.txt")"
+    PARAM_XSS_ACTIVE="$host_out/context/xss_candidates_active.txt"
+    PARAM_SQLI_ACTIVE="$host_out/context/sqli_candidates_active.txt"
+    prepare_active_param_candidates "$host_out/context/xss_candidates.txt" "$ALL_URLS_LIVE" "$PARAM_XSS_ACTIVE" "$PARAM_CHECK_LIMIT"
+    prepare_active_param_candidates "$host_out/context/sqli_candidates.txt" "$ALL_URLS_LIVE" "$PARAM_SQLI_ACTIVE" "$PARAM_CHECK_LIMIT"
+
+    print_done "xss candidates: $(count_file "$host_out/context/xss_candidates.txt")"
+    print_done "xss active candidates: $(count_file "$PARAM_XSS_ACTIVE")"
+    print_done "sqli candidates: $(count_file "$host_out/context/sqli_candidates.txt")"
+    print_done "sqli active candidates: $(count_file "$PARAM_SQLI_ACTIVE")"
+
+    run_dalfox_check "$host_out" "$PARAM_XSS_ACTIVE"
+    run_dsss_check "$host_out" "$PARAM_SQLI_ACTIVE"
 
     if have nuclei; then
       run_step_limited "nuclei general" "nuclei_general" "$host_out" nuclei \
