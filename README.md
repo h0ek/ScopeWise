@@ -34,6 +34,8 @@ ScopeWise is only an orchestrator. All credit goes to the original authors of th
 - [subzy](https://github.com/PentestPad/subzy)
 - [waybackurls](https://github.com/tomnomnom/waybackurls)
 - [wafw00f](https://github.com/EnableSecurity/wafw00f)
+- [Dalfox](https://github.com/hahwul/dalfox)
+- [SQLMap](https://github.com/sqlmapproject/sqlmap)
 
 Huge thanks to all tool authors.
 
@@ -139,6 +141,15 @@ wordlists:
   dir_medium: /usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt
   file_small: /usr/share/seclists/Discovery/Web-Content/raft-small-files.txt
   file_medium: /usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt
+
+limits:
+  katana_dirs_fast: 15
+  katana_dirs_deep: 50
+  step_timeout_seconds: 5400
+  param_check_urls: 25
+
+tools:
+  sqlmap_cmd: sqlmap
 ```
 `step_timeout_seconds` controls the automatic timeout for long-running non-core steps.
 
@@ -194,6 +205,11 @@ Main characteristics:
 - optionally runs `wafw00f` for additional WAF/CDN detection
 - dynamically selects Nmap ports based on WAF/CDN detection
 - runs fast-mode Nmap without default NSE scripts
+- extracts XSS candidates from parameterized URLs
+- extracts SQLi candidates from parameterized URLs
+- runs lightweight `dalfox` checks when XSS candidates exist
+- runs lightweight `sqlmap` checks when SQLi candidates exist
+- keeps LFI candidates as manual review only
 
 Runs:
 
@@ -212,6 +228,8 @@ Runs:
 - `sslscan`
 - `ffuf` dirs/files
 - `ffuf` on selected directories extracted from crawled URLs
+- `dalfox`, if installed and XSS candidates were found
+- `sqlmap`, if installed and SQLi candidates were found
 - `feroxbuster` reduced fast profile
 - `subfinder` and `bbot` for passive subdomain enumeration
 - `httpx` on discovered subdomains
@@ -262,18 +280,18 @@ Still runs:
 
 For each host:
 
-1. Normalize host input.
-2. Build base `http://` and `https://` URLs.
-3. `httpx` – verify live base URLs and web ports.
-4. Pick best target URL.
-5. `katana` – crawl endpoints and JavaScript-discovered URLs.
-6. `httpx` on crawled URLs – validate discovered endpoints.
-7. `waybackurls` – collect archived URLs if installed.
-8. Build URL context:
+- Normalize host input.
+- Build base `http://` and `https://` URLs.
+- `httpx` – verify live base URLs and web ports.
+- Pick best target URL.
+- `katana` – crawl endpoints and JavaScript-discovered URLs.
+- `httpx` on crawled URLs – validate discovered endpoints.
+- `waybackurls` – collect archived URLs if installed.
+- Build URL context:
    - `context/all_urls_raw.txt` – live URLs, crawled URLs and archived URLs
    - `context/all_urls_live.txt` – URLs validated with `httpx`
    - `context/all_urls.txt` – compatibility alias for raw URL context
-9. Generate triage files:
+- Generate triage files:
    - `context/interesting_files_raw.txt`
    - `context/interesting_files_live.txt`
    - `context/interesting_files.txt`
@@ -287,36 +305,44 @@ For each host:
    - `context/redirect_candidates.txt`
    - `context/lfi_candidates.txt`
    - `context/sqli_candidates.txt`
-10. Validate JavaScript candidates with `httpx`.
-11. `nuclei` general scan.
-12. `nuclei` exposure/misconfig scan.
-13. `nuclei` takeover scan.
-14. `nuclei` JavaScript exposure scan, only if live JS files were found.
-15. `nmap` – service detection on common web ports.
+   - `context/xss_candidates.txt`
+   - `context/xss_candidates_active.txt`
+   - `context/sqli_candidates_active.txt`
+- Validate JavaScript candidates with `httpx`.
+- Prepare limited active parameter-check input:
+   - `context/xss_candidates_active.txt`
+   - `context/sqli_candidates_active.txt`
+- Run lightweight XSS checks with `dalfox`, if candidates exist and the tool is installed.
+- Run lightweight SQLi checks with `sqlmap`, if candidates exist and the tool is installed.
+- `nuclei` general scan.
+- `nuclei` exposure/misconfig scan.
+- `nuclei` takeover scan.
+- `nuclei` JavaScript exposure scan, only if live JS files were found.
+- `nmap` – service detection on common web ports.
     - WAF/CDN detected: scan web/edge ports only.
     - No WAF/CDN detected: scan popular recon ports.
-16. `nikto` – common web misconfiguration scan.
-17. `sslscan` – TLS analysis.
-18. `ffuf` – directory discovery.
-19. `ffuf` – file discovery.
-20. `ffuf` on selected directories extracted from crawled URLs.
-21. `feroxbuster` – content discovery.
-22. `subfinder` and `bbot` – passive subdomain enumeration.
-23. Build combined subdomain list:
+- `nikto` – common web misconfiguration scan.
+- `sslscan` – TLS analysis.
+- `ffuf` – directory discovery.
+- `ffuf` – file discovery.
+- `ffuf` on selected directories extracted from crawled URLs.
+- `feroxbuster` – content discovery.
+- `subfinder` and `bbot` – passive subdomain enumeration.
+- Build combined subdomain list:
    - `context/subdomains.txt`
-24. Validate discovered subdomains with `httpx`:
+- Validate discovered subdomains with `httpx`:
    - `context/subdomain_urls_source.txt`
    - `context/live_subdomains.txt`
    - `context/live_subdomain_urls.txt`
    - `reports/subdomains_httpx.txt`
-25. `subzy` – subdomain takeover checks.
-26. `gowitness` – screenshots for main target URLs and live subdomain URLs.
-27. Detect Cloudflare/edge behavior where applicable. Run `wafw00f`, if installed, for additional WAF/CDN detection.
-28. Split low-confidence Cloudflare/WAF-style 403 results into separate files.
-29. Track tool status in `context/tool_status.tsv`.
-30. Record interrupted or timed-out steps where applicable.
-31. Create `reports/summary.md` inside the host output folder.
-32. Print final summary with total runtime and host-level counts.
+- `subzy` – subdomain takeover checks.
+- `gowitness` – screenshots for main target URLs and live subdomain URLs.
+- Detect Cloudflare/edge behavior where applicable. Run `wafw00f`, if installed, for additional WAF/CDN detection.
+- Split low-confidence Cloudflare/WAF-style 403 results into separate files.
+- Track tool status in `context/tool_status.tsv`.
+- Record interrupted or timed-out steps where applicable.
+- Create `reports/summary.md` inside the host output folder.
+- Print final summary with total runtime and host-level counts.
 
 ## Step Interruption and Timeout
 
@@ -384,6 +410,9 @@ scopewise/
                 │    ├── feroxbuster.txt
                 │    ├── feroxbuster_403_filtered.txt
                 │    ├── subzy.json
+                │    ├── dalfox_xss.txt
+                │    ├── sqlmap_sqli.txt
+                │    ├── sqlmap_light/
                 │    └── gowitness/
                 │
                 ├── context/          # mapping, URL collections and triage lists
@@ -425,6 +454,9 @@ scopewise/
                 │    ├── live_subdomain_urls.txt
                 │    ├── cloudflare_detected.txt
                 │    ├── edge_provider.txt
+                │    ├── xss_candidates.txt
+                │    ├── xss_candidates_active.txt
+                │    ├── sqli_candidates_active.txt
                 │    ├── tool_status.tsv
                 │    └── bbot_subdomains.txt
                 │
@@ -446,33 +478,40 @@ These are the first files worth opening after a run:
 
 Scanner and finding reports:
 
-2. `reports/nuclei_exposures.jsonl` – exposed files, backups, configs, logs, misconfigs
-3. `reports/nuclei_takeover.jsonl` – possible subdomain takeover findings
-4. `reports/nuclei.jsonl` – general nuclei findings
-5. `reports/nikto.json` – Nikto output, if available
-6. `reports/nmap_web.xml` – nmap web-port scan
-7. `reports/sslscan.xml` – TLS scan
-8. `reports/feroxbuster.txt` – filtered content discovery results
-9. `reports/ffuf_files.csv` – file discovery results
-10. `reports/ffuf_dirs.csv` – directory discovery results
-11. `reports/ffuf_katana_dirs.csv` – selected directory fuzzing results
-12. `reports/subzy.json` – subdomain takeover checks
-13. `reports/subdomains_httpx.txt` – live subdomain HTTP probe output
-14. `reports/gowitness/` – screenshots and gowitness database/exports
-15. `reports/wafw00f.txt` – WAF/CDN detection output, if available
+- `reports/nuclei_exposures.jsonl` – exposed files, backups, configs, logs, misconfigs
+- `reports/nuclei_takeover.jsonl` – possible subdomain takeover findings
+- `reports/nuclei.jsonl` – general nuclei findings
+- `reports/nikto.json` – Nikto output, if available
+- `reports/nmap_web.xml` – nmap web-port scan
+- `reports/sslscan.xml` – TLS scan
+- `reports/feroxbuster.txt` – filtered content discovery results
+- `reports/ffuf_files.csv` – file discovery results
+- `reports/ffuf_dirs.csv` – directory discovery results
+- `reports/ffuf_katana_dirs.csv` – selected directory fuzzing results
+- `reports/dalfox_xss.txt` – lightweight XSS check results
+- `reports/sqlmap_sqli.txt` – lightweight SQLi verification output
+- `reports/sqlmap_light/` – SQLMap output directory
+- `reports/subzy.json` – subdomain takeover checks
+- `reports/subdomains_httpx.txt` – live subdomain HTTP probe output
+- `reports/gowitness/` – screenshots and gowitness database/exports
+- `reports/wafw00f.txt` – WAF/CDN detection output, if available
 
 Validated context:
 
-15. `context/interesting_files_live.txt` – live URLs pointing to backups, configs, databases, logs, maps and similar files
-16. `context/api_candidates_live.txt` – live API, Swagger, OpenAPI and GraphQL candidates
-17. `context/js_files.txt` – live JavaScript files worth reviewing for endpoints/secrets
-18. `context/live_subdomain_urls.txt` – live subdomain URLs ready for manual follow-up scans
-19. `context/live_subdomains.txt` – live subdomain hostnames
+- `context/interesting_files_live.txt` – live URLs pointing to backups, configs, databases, logs, maps and similar files
+- `context/api_candidates_live.txt` – live API, Swagger, OpenAPI and GraphQL candidates
+- `context/js_files.txt` – live JavaScript files worth reviewing for endpoints/secrets
+- `context/live_subdomain_urls.txt` – live subdomain URLs ready for manual follow-up scans
+- `context/live_subdomains.txt` – live subdomain hostnames
+- `context/xss_candidates.txt` – XSS-like parameter candidates
+- `context/xss_candidates_active.txt` – limited XSS candidate list used by Dalfox
+- `context/sqli_candidates.txt` – SQLi-like parameter candidates
+- `context/sqli_candidates_active.txt` – limited SQLi candidate list used by SQLMap
 
 Manual queues:
 
-20. `context/interesting_params.txt` – raw parameter review queue
-21. `context/source_maps.txt` – source map candidates
+- `context/interesting_params.txt` – raw parameter review queue
+- `context/source_maps.txt` – source map candidates
 
 ### Surface Mapping / Context
 
@@ -552,6 +591,23 @@ Review:
 When a WAF/CDN is detected, `nmap`, `sslscan`, `nikto` and many 403 responses may describe edge/WAF behavior rather than the origin application.
 
 In that case, ScopeWise limits Nmap to web/edge ports. If no WAF/CDN is detected, ScopeWise scans a broader list of common high-value recon ports.
+
+### Parameter Testing Queues
+
+ScopeWise extracts parameterized URLs into focused queues.
+
+- `context/interesting_params.txt` – broad parameter review list
+- `context/xss_candidates.txt` – XSS-like parameter candidates
+- `context/sqli_candidates.txt` – SQLi-like parameter candidates
+- `context/lfi_candidates.txt` – LFI/path traversal candidates
+- `context/redirect_candidates.txt` – possible open redirect candidates
+
+ScopeWise runs lightweight automatic checks only for XSS and SQLi:
+
+- XSS: `dalfox`
+- SQLi: `sqlmap` light mode
+
+LFI remains a manual queue.
 
 ### Tool Status
 
