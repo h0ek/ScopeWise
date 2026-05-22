@@ -2,7 +2,7 @@
 set -euo pipefail
 
 APP_NAME="scopewise"
-APP_VER="0.3.6"
+APP_VER="0.3.7"
 
 MODE="fast"
 TARGET_SINGLE=""
@@ -12,7 +12,7 @@ CHECK_ONLY=0
 MODE_CLI=""
 STEP_MAX_SECONDS="5400"
 PARAM_CHECK_LIMIT="25"
-DSSS_CMD="dsss"
+SQLMAP_CMD="sqlmap"
 
 WEB_PORTS="80,443"
 WEB_PORTS_DEEP="80,443,8080,8443,8000,8888,3000,5000,9000"
@@ -295,12 +295,7 @@ filter_ferox_fast_output() {
         next
       }
 
-      if (status == "403" && cf == "1") {
-        print $0 >> dropped
-        next
-      }
-
-      if (status == "403" && !high_signal_403(path)) {
+      if (status == "403") {
         print $0 >> dropped
         next
       }
@@ -533,7 +528,7 @@ load_config() {
       limits.katana_dirs_deep) CONFIG_KATANA_DIR_LIMIT_DEEP="$val" ;;
       limits.step_timeout_seconds) STEP_MAX_SECONDS="$val" ;;
       limits.param_check_urls) PARAM_CHECK_LIMIT="$val" ;;
-      tools.dsss_cmd) DSSS_CMD="$val" ;;
+      tools.sqlmap_cmd) SQLMAP_CMD="$val" ;;
     esac
   done <"$cfg"
 }
@@ -593,12 +588,12 @@ run_dependency_check() {
       printf '  %-14s missing\n' "$t"
     fi
   done
-  if have "$DSSS_CMD"; then
-    printf '  %-14s OK      %s\n' "dsss" "$DSSS_CMD"
-  elif [[ -f "$DSSS_CMD" ]] && have python3; then
-    printf '  %-14s OK      %s\n' "dsss" "$DSSS_CMD"
+  if have "$SQLMAP_CMD"; then
+    printf '  %-14s OK      %s\n' "sqlmap" "$SQLMAP_CMD"
+  elif [[ -f "$SQLMAP_CMD" ]] && have python3; then
+    printf '  %-14s OK      %s\n' "sqlmap" "$SQLMAP_CMD"
   else
-    printf '  %-14s missing %s\n' "dsss" "$DSSS_CMD"
+    printf '  %-14s missing %s\n' "sqlmap" "$SQLMAP_CMD"
   fi
   printf '\nConfigured wordlists:\n'
   check_file_status "common" "$WL_COMMON"
@@ -621,7 +616,7 @@ run_dependency_check() {
   printf '  nmap recon ports: %s\n' "$NMAP_RECON_PORTS"
   printf '  step timeout seconds: %s\n' "$STEP_MAX_SECONDS"
   printf '  param check url limit: %s\n' "$PARAM_CHECK_LIMIT"
-  printf '  dsss command: %s\n' "$DSSS_CMD"
+  printf '  sqlmap command: %s\n' "$SQLMAP_CMD"
 }
 
 count_jsonl() {
@@ -851,6 +846,12 @@ validate_live_url_file() {
     awk '$0 ~ /\[(200|204|206|301|302|307|308|401|403)\]/ {print $1}' "$httpx_output" \
       | grep -E '^https?://' \
       | sort -u >"$live_output" || true
+
+    if [[ ! -s "$live_output" ]]; then
+      print_warn "$label empty output"
+      record_tool_status "$tool" "empty" "$label empty output"
+      log_line "WARN: $label empty output"
+    fi
   else
     cp -f "$input" "$live_output"
   fi
@@ -964,14 +965,18 @@ validate_live_js_files() {
 }
 
 prepare_active_param_candidates() {
-  local source_file="$1"
-  local live_urls="$2"
-  local output_file="$3"
-  local limit="${4:-0}"
+  local label="$1"
+  local tool="$2"
+  local host_out="$3"
+  local source_file="$4"
+  local output_file="$5"
+  local httpx_output="$6"
+  local limit="${7:-0}"
   local tmp_clean="${output_file}.clean.tmp"
   local tmp_live="${output_file}.live.tmp"
 
   : >"$output_file"
+  : >"$httpx_output"
   : >"$tmp_clean"
   : >"$tmp_live"
 
@@ -981,8 +986,20 @@ prepare_active_param_candidates() {
     return 0
   }
 
-  if [[ -s "$live_urls" ]]; then
-    grep -Fxf "$tmp_clean" "$live_urls" | sort -u >"$tmp_live" || true
+  if have httpx; then
+    run_step "$label" "$tool" "$host_out" httpx \
+      -l "$tmp_clean" \
+      -silent \
+      -sc \
+      -cl \
+      -title \
+      -follow-host-redirects \
+      -rl "$HTTPX_RL" \
+      -o "$httpx_output" || true
+
+    awk '$0 ~ /\[(200|204|206|301|302|307|308|401|403)\]/ {print $1}' "$httpx_output" \
+      | grep -E '^https?://' \
+      | sort -u >"$tmp_live" || true
   else
     cp -f "$tmp_clean" "$tmp_live"
   fi
@@ -993,6 +1010,10 @@ prepare_active_param_candidates() {
     else
       cp -f "$tmp_live" "$output_file"
     fi
+  else
+    print_warn "$label empty output"
+    record_tool_status "$tool" "empty" "$label empty output"
+    log_line "WARN: $label empty output"
   fi
 
   rm -f "$tmp_clean" "$tmp_live"
@@ -1011,44 +1032,97 @@ run_dalfox_check() {
 
   if have dalfox; then
     run_step_limited "dalfox xss" "dalfox_xss" "$host_out" dalfox file "$input_file" --silence --output "$output_file" || true
+    if [[ ! -s "$output_file" ]]; then
+      print_warn "dalfox xss empty output"
+      record_tool_status "dalfox_xss" "empty" "dalfox xss empty output"
+      log_line "WARN: dalfox xss empty output"
+    fi
   else
     print_skip "dalfox xss (not installed)"
   fi
 }
 
-run_dsss_check() {
+run_sqlmap_check() {
   local host_out="$1"
   local input_file="$2"
-  local output_file="$host_out/reports/dsss_sqli.txt"
+  local output_file="$host_out/reports/sqlmap_sqli.txt"
+  local output_dir="$host_out/reports/sqlmap_light"
   : >"$output_file"
+  mkdir -p "$output_dir"
 
   if [[ ! -s "$input_file" ]]; then
-    print_skip "dsss sqli (no candidates)"
+    print_skip "sqlmap sqli (no candidates)"
     return 0
   fi
 
-  if have "$DSSS_CMD" || { [[ -f "$DSSS_CMD" ]] && have python3; }; then
-    run_step_limited "dsss sqli" "dsss_sqli" "$host_out" \
-      bash -c '
-        set -euo pipefail
-        cmd="$1"
-        input="$2"
-        output="$3"
-        : >"$output"
-        while IFS= read -r url; do
-          [[ -n "$url" ]] || continue
-          printf "### %s\n" "$url" >>"$output"
-          if [[ -f "$cmd" ]]; then
-            python3 "$cmd" -u "$url" >>"$output" 2>&1 || true
-          else
-            "$cmd" -u "$url" >>"$output" 2>&1 || true
-          fi
-          printf "\n" >>"$output"
-        done <"$input"
-      ' bash "$DSSS_CMD" "$input_file" "$output_file" || true
+  if have "$SQLMAP_CMD" || { [[ -f "$SQLMAP_CMD" ]] && have python3; }; then
+    if [[ -f "$SQLMAP_CMD" ]]; then
+      run_step_limited "sqlmap sqli" "sqlmap_sqli" "$host_out" \
+        bash -c 'python3 "$1" -m "$2" --batch --smart --level=1 --risk=1 --random-agent --threads=1 --output-dir="$3" >"$4" 2>&1' \
+        bash "$SQLMAP_CMD" "$input_file" "$output_dir" "$output_file" || true
+    else
+      run_step_limited "sqlmap sqli" "sqlmap_sqli" "$host_out" \
+        bash -c '"$1" -m "$2" --batch --smart --level=1 --risk=1 --random-agent --threads=1 --output-dir="$3" >"$4" 2>&1' \
+        bash "$SQLMAP_CMD" "$input_file" "$output_dir" "$output_file" || true
+    fi
+    if [[ ! -s "$output_file" ]]; then
+      print_warn "sqlmap sqli empty output"
+      record_tool_status "sqlmap_sqli" "empty" "sqlmap sqli empty output"
+      log_line "WARN: sqlmap sqli empty output"
+    fi
   else
-    print_skip "dsss sqli (not installed)"
+    print_skip "sqlmap sqli (not installed)"
   fi
+}
+
+detect_nmap_anomaly() {
+  local nmap_file="$1"
+  local anomaly_file="$2"
+  : >"$anomaly_file"
+  [[ -s "$nmap_file" ]] || { printf 'no\n' >"$anomaly_file"; return 1; }
+  awk '
+    /^[0-9]+\/tcp[[:space:]]+open/ {
+      open++
+      if ($0 ~ /\?|unknown|tcpwrapped/) weak++
+    }
+    END {
+      if (open >= 20 && weak >= int(open/2)) print "yes: many open ports with weak or uncertain service fingerprints; possible firewall/proxy/tarpit behavior"
+      else print "no"
+    }
+  ' "$nmap_file" >"$anomaly_file" || printf 'no\n' >"$anomaly_file"
+  grep -q '^yes:' "$anomaly_file"
+}
+
+detect_ffuf_redirect_noise() {
+  local input="$1"
+  local output="$2"
+  : >"$output"
+  [[ -s "$input" ]] || { printf 'no\n' >"$output"; return 1; }
+  awk -F',' '
+    NR == 1 {
+      status_idx=0
+      for (i=1; i<=NF; i++) {
+        h=$i
+        gsub(/^"|"$/, "", h)
+        if (h == "status_code" || h == "status") status_idx=i
+      }
+      next
+    }
+    $0 != "" {
+      status=""
+      if (status_idx > 0) {
+        status=$status_idx
+        gsub(/^"|"$/, "", status)
+      }
+      if (status ~ /^(301|302|307|308)$/) redirects++
+      total++
+    }
+    END {
+      if (redirects >= 10 && total > 0) print "yes: many redirects in ffuf output; possible CMS/router redirect noise"
+      else print "no"
+    }
+  ' "$input" >"$output" || printf 'no\n' >"$output"
+  grep -q '^yes:' "$output"
 }
 
 count_file() {
@@ -1071,6 +1145,8 @@ write_host_summary() {
   local waf_provider="none"
   local nmap_mode="unknown"
   local nmap_ports=""
+  local nmap_anomaly="no"
+  local ffuf_noise="no"
   local cf_note=""
   local status_file="$host_out/context/tool_status.tsv"
   local ok_count=0
@@ -1090,6 +1166,8 @@ write_host_summary() {
   [[ -f "$host_out/context/waf_provider.txt" ]] && waf_provider="$(cat "$host_out/context/waf_provider.txt" 2>/dev/null | head -n 1)"
   [[ -f "$host_out/context/nmap_mode.txt" ]] && nmap_mode="$(cat "$host_out/context/nmap_mode.txt" 2>/dev/null | head -n 1)"
   [[ -f "$host_out/context/nmap_ports.txt" ]] && nmap_ports="$(cat "$host_out/context/nmap_ports.txt" 2>/dev/null | head -n 1)"
+  [[ -f "$host_out/context/nmap_anomaly.txt" ]] && nmap_anomaly="$(cat "$host_out/context/nmap_anomaly.txt" 2>/dev/null | head -n 1)"
+  [[ -f "$host_out/context/ffuf_noise_note.txt" ]] && ffuf_noise="$(cat "$host_out/context/ffuf_noise_note.txt" 2>/dev/null | head -n 1)"
 
   if [[ "$cf" == "yes" || "$waf" == "yes" ]]; then
     cf_note="Cloudflare/WAF/CDN was detected. Treat 403 results as low-confidence edge/WAF responses unless the body confirms a real resource. nmap and sslscan may describe the edge, not the origin."
@@ -1122,6 +1200,8 @@ write_host_summary() {
 | WAF/CDN provider | $waf_provider |
 | Nmap mode | $nmap_mode |
 | Nmap ports | $nmap_ports |
+| Nmap anomaly | $nmap_anomaly |
+| FFUF noise note | $ffuf_noise |
 | Host time | $(format_duration "$host_elapsed") |
 | Live URLs | $(count_file "$host_out/context/all_urls_live.txt") |
 | Raw URLs | $(count_file "$host_out/context/all_urls_raw.txt") |
@@ -1143,7 +1223,7 @@ write_host_summary() {
 | Nuclei takeover findings | $(count_jsonl "$host_out/reports/nuclei_takeover.jsonl") |
 | Nuclei JS findings | $(count_jsonl "$host_out/reports/nuclei_js_exposure.jsonl") |
 | Dalfox output lines | $(count_file "$host_out/reports/dalfox_xss.txt") |
-| DSSS output lines | $(count_file "$host_out/reports/dsss_sqli.txt") |
+| SQLMap output lines | $(count_file "$host_out/reports/sqlmap_sqli.txt") |
 | FFUF dirs | $(count_csv_data "$host_out/reports/ffuf_dirs.csv") |
 | FFUF dirs 403 | $(count_csv_data "$host_out/reports/ffuf_dirs_403.csv") |
 | FFUF files | $(count_csv_data "$host_out/reports/ffuf_files.csv") |
@@ -1170,6 +1250,9 @@ Ctrl+C skips the currently running step, preserves partial output when the under
 - ${BT}reports/nikto.json${BT} \u2013 Nikto output, if available
 - ${BT}reports/nmap_web.xml${BT} \u2013 nmap scan; ports depend on WAF/CDN detection and mode
 - ${BT}reports/wafw00f.txt${BT} \u2013 WAF/CDN detection output, if available
+- ${BT}reports/dalfox_xss.txt${BT} \u2013 lightweight XSS check results
+- ${BT}reports/sqlmap_sqli.txt${BT} \u2013 lightweight SQLi verification output
+- ${BT}reports/sqlmap_light/${BT} \u2013 SQLMap output directory
 - ${BT}reports/sslscan.xml${BT} \u2013 TLS scan
 - ${BT}context/interesting_files_live.txt${BT} \u2013 live interesting files
 - ${BT}context/api_candidates_live.txt${BT} \u2013 live API candidates
@@ -1192,6 +1275,8 @@ Ctrl+C skips the currently running step, preserves partial output when the under
 - ${BT}context/xss_candidates.txt${BT}
 - ${BT}context/xss_candidates_active.txt${BT}
 - ${BT}context/sqli_candidates_active.txt${BT}
+- ${BT}context/nmap_anomaly.txt${BT}
+- ${BT}context/ffuf_noise_note.txt${BT}
 - ${BT}context/waybackurls.txt${BT}
 - ${BT}context/subdomains.txt${BT}
 - ${BT}context/subdomain_urls_source.txt${BT}
@@ -1529,8 +1614,8 @@ for host in "${HOSTS[@]}"; do
     print_done "live js files: $(count_file "$host_out/context/js_files.txt")"
     PARAM_XSS_ACTIVE="$host_out/context/xss_candidates_active.txt"
     PARAM_SQLI_ACTIVE="$host_out/context/sqli_candidates_active.txt"
-    prepare_active_param_candidates "$host_out/context/xss_candidates.txt" "$ALL_URLS_LIVE" "$PARAM_XSS_ACTIVE" "$PARAM_CHECK_LIMIT"
-    prepare_active_param_candidates "$host_out/context/sqli_candidates.txt" "$ALL_URLS_LIVE" "$PARAM_SQLI_ACTIVE" "$PARAM_CHECK_LIMIT"
+    prepare_active_param_candidates "httpx (xss candidates)" "httpx_xss_candidates" "$host_out" "$host_out/context/xss_candidates.txt" "$PARAM_XSS_ACTIVE" "$host_out/context/xss_candidates_httpx.txt" "$PARAM_CHECK_LIMIT"
+    prepare_active_param_candidates "httpx (sqli candidates)" "httpx_sqli_candidates" "$host_out" "$host_out/context/sqli_candidates.txt" "$PARAM_SQLI_ACTIVE" "$host_out/context/sqli_candidates_httpx.txt" "$PARAM_CHECK_LIMIT"
 
     print_done "xss candidates: $(count_file "$host_out/context/xss_candidates.txt")"
     print_done "xss active candidates: $(count_file "$PARAM_XSS_ACTIVE")"
@@ -1538,7 +1623,7 @@ for host in "${HOSTS[@]}"; do
     print_done "sqli active candidates: $(count_file "$PARAM_SQLI_ACTIVE")"
 
     run_dalfox_check "$host_out" "$PARAM_XSS_ACTIVE"
-    run_dsss_check "$host_out" "$PARAM_SQLI_ACTIVE"
+    run_sqlmap_check "$host_out" "$PARAM_SQLI_ACTIVE"
 
     if have nuclei; then
       run_step_limited "nuclei general" "nuclei_general" "$host_out" nuclei \
@@ -1616,6 +1701,11 @@ for host in "${HOSTS[@]}"; do
             -p "$NMAP_PORTS_SELECTED" \
             -oA "$host_out/reports/nmap_web" \
             "$host" || true
+        fi
+        if detect_nmap_anomaly "$host_out/reports/nmap_web.nmap" "$host_out/context/nmap_anomaly.txt"; then
+          nmap_note="$(cat "$host_out/context/nmap_anomaly.txt" 2>/dev/null | head -n 1)"
+          print_warn "nmap anomaly: $nmap_note"
+          log_line "WARN: nmap anomaly: $nmap_note"
         fi
       else
         print_skip "nmap (not installed)"
@@ -1704,6 +1794,11 @@ for host in "${HOSTS[@]}"; do
           split_ffuf_403_csv "$host_out/reports/ffuf_files.csv" "$host_out/reports/ffuf_files.no403.csv" "$host_out/reports/ffuf_files_403.csv"
           mv -f "$host_out/reports/ffuf_files.no403.csv" "$host_out/reports/ffuf_files.csv"
           print_done "ffuf files 403 split: $(count_file "$host_out/reports/ffuf_files_403.csv") lines"
+        fi
+        if detect_ffuf_redirect_noise "$host_out/reports/ffuf_dirs.csv" "$host_out/context/ffuf_noise_note.txt"; then
+          ffuf_note="$(cat "$host_out/context/ffuf_noise_note.txt" 2>/dev/null | head -n 1)"
+          print_warn "ffuf noise note: $ffuf_note"
+          log_line "WARN: ffuf noise note: $ffuf_note"
         fi
       else
         print_skip "ffuf (not installed)"
